@@ -67,19 +67,23 @@ class PrinterManager {
     bool stopBle = true,
     bool stopUsb = true,
   }) async {
-    try {
-      if (stopBle) {
+    if (stopBle) {
+      try {
         await _stopBleStateSync();
         await _bleSubscription?.cancel();
         _bleSubscription = null;
         await UniversalBle.stopScan();
+      } catch (e) {
+        log('Failed to stop BLE scan: $e');
       }
-      if (stopUsb) {
+    }
+    if (stopUsb) {
+      try {
         await _usbSubscription?.cancel();
         _usbSubscription = null;
+      } catch (e) {
+        log('Failed to stop USB scan: $e');
       }
-    } catch (e) {
-      log('Failed to stop scanning for devices: $e');
     }
   }
 
