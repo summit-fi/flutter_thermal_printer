@@ -485,7 +485,6 @@ class PrinterManager {
       );
     } catch (e) {
       log('Failed to start BLE scan: $e');
-      rethrow;
     }
   }
 
