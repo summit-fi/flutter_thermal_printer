@@ -4,6 +4,9 @@
 #include "include/flutter_thermal_printer/flutter_thermal_printer_plugin.h"
 
 #include <cups/cups.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <cstring>
 #include <string>
@@ -77,8 +80,67 @@ static bool cups_printer_exists(const char* printer_name) {
   return found;
 }
 
-// Sends raw ESC/POS bytes to a CUPS queue as a RAW job.
-// Returns true on success.
+// Sends raw ESC/POS bytes using `lp -d <printer> -o raw <tmpfile>`.
+//
+// This mirrors the macOS implementation (tryPrintWithCups in Swift) and is
+// critical for correctness: using the CUPS C API with CUPS_FORMAT_RAW
+// ("application/octet-stream") still runs data through the printer driver
+// filter chain, which corrupts ESC/POS raster image (GS v 0) commands.
+// `lp -o raw` maps to "application/vnd.cups-raw" internally, which bypasses
+// ALL driver filters and delivers bytes unmodified to the printer.
+static bool lp_print_raw(const char* printer_name,
+                         const uint8_t* data,
+                         size_t data_len) {
+  // Write data to a secure temp file.
+  char tmp_path[] = "/tmp/flutter_thermal_XXXXXX";
+  const int fd = mkstemp(tmp_path);
+  if (fd < 0) return false;
+
+  // Write all bytes, handling partial writes.
+  size_t written = 0;
+  while (written < data_len) {
+    const ssize_t n =
+        write(fd, data + written, data_len - written);
+    if (n <= 0) {
+      close(fd);
+      unlink(tmp_path);
+      return false;
+    }
+    written += static_cast<size_t>(n);
+  }
+  close(fd);
+
+  // Fork and exec `lp -d <printer> -o raw <file>`.
+  // Using execl avoids shell injection — printer_name is passed as a direct
+  // argument, never interpolated into a shell command string.
+  const pid_t pid = fork();
+  if (pid < 0) {
+    unlink(tmp_path);
+    return false;
+  }
+
+  if (pid == 0) {
+    // Child process: try standard lp locations.
+    execl("/usr/bin/lp", "lp",
+          "-d", printer_name, "-o", "raw", tmp_path,
+          static_cast<char*>(nullptr));
+    execl("/usr/local/bin/lp", "lp",
+          "-d", printer_name, "-o", "raw", tmp_path,
+          static_cast<char*>(nullptr));
+    _exit(EXIT_FAILURE);  // execl failed.
+  }
+
+  // Parent: wait for child to finish.
+  int status = 0;
+  waitpid(pid, &status, 0);
+  unlink(tmp_path);
+
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+// Fallback: CUPS C API with CUPS_FORMAT_RAW.
+// Used only when lp_print_raw fails (e.g. lp binary not found).
+// NOTE: this may be filtered by the printer driver on some setups.
 static bool cups_print_raw(const char* printer_name,
                            const uint8_t* data,
                            size_t data_len) {
@@ -225,9 +287,16 @@ static void method_call_cb(FlMethodChannel* channel,
                 "INVALID_ARGS", "Data is empty or unsupported type",
                 nullptr));
           } else {
-            const bool ok = cups_print_raw(printer_name.c_str(),
-                                           data_bytes.data(),
-                                           data_bytes.size());
+            // Primary: lp -o raw (bypasses all CUPS driver filters).
+            // Fallback: CUPS C API (may be filtered by printer driver).
+            bool ok = lp_print_raw(printer_name.c_str(),
+                                   data_bytes.data(),
+                                   data_bytes.size());
+            if (!ok) {
+              ok = cups_print_raw(printer_name.c_str(),
+                                  data_bytes.data(),
+                                  data_bytes.size());
+            }
             if (ok) {
               g_autoptr(FlValue) result = fl_value_new_bool(TRUE);
               response =
