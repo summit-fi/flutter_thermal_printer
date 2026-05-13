@@ -273,7 +273,8 @@ class PrinterManager {
         final mtu = chunkSize ??
             (Platform.isWindows
                 ? 50
-                : await printer.requestMtu(Platform.isMacOS ? 150 : 500));
+                : await printer.requestMtu(
+                    Platform.isMacOS || Platform.isLinux ? 150 : 500));
         final maxChunkSize = mtu - 3;
 
         for (var i = 0; i < bytes.length; i += maxChunkSize) {
