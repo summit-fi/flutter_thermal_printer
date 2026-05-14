@@ -313,7 +313,7 @@ class FlutterThermalPrinter {
 
     imagebytes = _buildImageRasterAvailable(imagebytes);
 
-    if ((Platform.isMacOS || Platform.isWindows) &&
+    if ((Platform.isMacOS || Platform.isWindows || Platform.isLinux) &&
         printer.connectionType == ConnectionType.USB) {
       List<int> raster;
       raster = ticket.imageRaster(imagebytes);
