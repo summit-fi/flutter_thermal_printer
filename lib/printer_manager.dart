@@ -254,15 +254,22 @@ class PrinterManager {
       try {
         final services = await printer.discoverServices();
 
+        // Star ISSC (TSP100IIIBI) and some other BLE printer chips expose
+        // their write characteristic with `writeWithoutResponse` only — we
+        // must accept both flavours, otherwise the loop silently picks the
+        // wrong service or returns null.
         BleCharacteristic? writeCharacteristic;
         for (final service in services) {
           for (final characteristic in service.characteristics) {
-            if (characteristic.properties.contains(
-              CharacteristicProperty.write,
-            )) {
+            final props = characteristic.properties;
+            if (props.contains(CharacteristicProperty.write) ||
+                props.contains(CharacteristicProperty.writeWithoutResponse)) {
               writeCharacteristic = characteristic;
               break;
             }
+          }
+          if (writeCharacteristic != null) {
+            break;
           }
         }
 

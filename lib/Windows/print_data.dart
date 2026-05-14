@@ -20,10 +20,14 @@ class RawPrinter {
 
     final printerNamePtr = printerName.toNativeUtf16();
     final docNamePtr = 'ESC/POS Print Job'.toNativeUtf16();
+    // Force RAW datatype so the spooler bypasses the printer driver's
+    // GDI conversion path. Without this, drivers (esp. Star line-mode and
+    // POS Class drivers) can mangle Star Graphics / ESC/POS bytes.
+    final dataTypePtr = 'RAW'.toNativeUtf16();
 
     docInfo.ref.pDocName = docNamePtr;
     docInfo.ref.pOutputFile = nullptr;
-    docInfo.ref.pDatatype = nullptr;
+    docInfo.ref.pDatatype = dataTypePtr;
 
     if (OpenPrinter(printerNamePtr, hPrinter, nullptr) != 0) {
       final printerHandle = hPrinter.value;
@@ -51,6 +55,7 @@ class RawPrinter {
     calloc
       ..free(printerNamePtr)
       ..free(docNamePtr)
+      ..free(dataTypePtr)
       ..free(hPrinter)
       ..free(docInfo);
   }
