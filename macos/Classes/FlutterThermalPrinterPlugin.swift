@@ -152,19 +152,34 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
     
     private func printRawDataWithMultipleMethods(printer: NSPrinter, data: Data) -> Bool {
         print("Attempting to print \(data.count) bytes to printer: \(printer.name)")
-        
+
         // Use only CUPS method for printing
         if let success = tryPrintWithCups(printer: printer, data: data) {
-            print("Successfully printed using CUPS method")
+            if success {
+                print("Successfully printed using CUPS method")
+            } else {
+                print("CUPS printing method returned failure for printer: \(printer.name)")
+            }
             return success
         }
-        
+
         print("CUPS printing method failed for printer: \(printer.name)")
         return false
     }
-    
-    
-    
+
+    // CUPS queue names are restricted to [A-Za-z0-9_], so macOS replaces every
+    // non-alphanumeric character (space, hyphen, dot, etc.) with an underscore
+    // when registering a queue. `NSPrinter.name` returns the human-readable
+    // display name, so we have to sanitize it the same way before passing it
+    // to `lp -d` / `lpr -P`.
+    private func cupsQueueName(from displayName: String) -> String {
+        return displayName.replacingOccurrences(
+            of: "[^A-Za-z0-9_]",
+            with: "_",
+            options: .regularExpression
+        )
+    }
+
     private func tryPrintWithLpr(printer: NSPrinter, data: Data) -> Bool? {
         do {
             // Create a temporary file with the print data
@@ -183,7 +198,7 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
                 if FileManager.default.fileExists(atPath: lprPath) {
                     let process = Process()
                     process.executableURL = URL(fileURLWithPath: lprPath)
-                    process.arguments = ["-P", printer.name, "-o", "raw", tempURL.path]
+                    process.arguments = ["-P", cupsQueueName(from: printer.name), "-o", "raw", tempURL.path]
                     
                     // Capture both standard output and error for better debugging
                     let errorPipe = Pipe()
@@ -256,7 +271,7 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
                     
                     // Use comprehensive CUPS options for thermal printing
                     process.arguments = [
-                        "-d", printer.name.replacingOccurrences(of: " ", with: "_"),           // Destination printer
+                        "-d", cupsQueueName(from: printer.name),           // Destination printer
                         "-o", "raw",                  // Send raw data without processing
                         "-o", "fit-to-page",          // Fit content to page
                         "-o", "media=Custom.80x200mm", // Set paper size for thermal printers
@@ -326,7 +341,7 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
         process.executableURL = URL(fileURLWithPath: lpPath)
         
         // Use minimal arguments for compatibility
-        process.arguments = ["-d", printer.name, "-o", "raw", tempURL.path]
+        process.arguments = ["-d", cupsQueueName(from: printer.name), "-o", "raw", tempURL.path]
         
         let errorPipe = Pipe()
         let outputPipe = Pipe()
