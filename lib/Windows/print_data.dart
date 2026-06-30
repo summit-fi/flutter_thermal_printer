@@ -15,7 +15,7 @@ class RawPrinter {
   final Arena alloc;
 
   void printEscPosWin32(List<int> data) {
-    final hPrinter = calloc<HANDLE>();
+    final hPrinter = calloc<Pointer>();
     final docInfo = calloc<DOC_INFO_1>();
 
     final printerNamePtr = printerName.toNativeUtf16();
@@ -25,25 +25,31 @@ class RawPrinter {
     // POS Class drivers) can mangle Star Graphics / ESC/POS bytes.
     final dataTypePtr = 'RAW'.toNativeUtf16();
 
-    docInfo.ref.pDocName = docNamePtr;
-    docInfo.ref.pOutputFile = nullptr;
-    docInfo.ref.pDatatype = dataTypePtr;
+    docInfo.ref.pDocName = PWSTR(docNamePtr);
+    docInfo.ref.pOutputFile = PWSTR(nullptr);
+    docInfo.ref.pDatatype = PWSTR(dataTypePtr);
 
-    if (OpenPrinter(printerNamePtr, hPrinter, nullptr) != 0) {
-      final printerHandle = hPrinter.value;
+    if (OpenPrinter(PCWSTR(printerNamePtr), hPrinter, null).value) {
+      final printerHandle = PRINTER_HANDLE(hPrinter.value);
 
-      if (StartDocPrinter(printerHandle, 1, docInfo.cast()) != 0) {
+      if (StartDocPrinter(printerHandle, 1, docInfo) != 0) {
         StartPagePrinter(printerHandle);
 
         final buffer = Uint8List.fromList(data);
         final bytesWritten = calloc<DWORD>();
+        final nativeBuffer = calloc<Uint8>(buffer.length);
+        nativeBuffer.asTypedList(buffer.length).setAll(0, buffer);
 
         WritePrinter(
           printerHandle,
-          buffer.allocatePointer(),
+          nativeBuffer,
           buffer.length,
           bytesWritten,
         );
+
+        calloc
+          ..free(nativeBuffer)
+          ..free(bytesWritten);
 
         EndPagePrinter(printerHandle);
         EndDocPrinter(printerHandle);
