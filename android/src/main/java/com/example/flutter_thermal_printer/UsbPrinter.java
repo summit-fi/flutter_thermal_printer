@@ -143,7 +143,7 @@ public class UsbPrinter implements EventChannel.StreamHandler {
     private Integer requestingPermission = 0;
 
     //    Connect using VendorId and ProductId
-    public void connect(String vendorId, String productId) {
+    public boolean connect(String vendorId, String productId) {
         connectionVendorId = vendorId;
         connectionProductId = productId;
         UsbManager m = (UsbManager) context.getSystemService(Context.USB_SERVICE);
@@ -160,16 +160,18 @@ public class UsbPrinter implements EventChannel.StreamHandler {
 
         if (device == null) {
             Log.d(TAG, "Device not found.");
-            return;
+            return false;
         }
 
         if (!m.hasPermission(device) && requestingPermission <2) {
             requestingPermission++;
             PendingIntent permissionIntent = PendingIntent.getBroadcast(context, 0, new Intent(ACTION_USB_PERMISSION), PendingIntent.FLAG_IMMUTABLE);
             m.requestPermission(device, permissionIntent);
+            return false;
         } else {
             requestingPermission = 0;
             sendDevice(device); // Proceed directly if permission exists
+            return m.hasPermission(device);
         }
     }
 
