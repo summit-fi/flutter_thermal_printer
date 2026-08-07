@@ -59,8 +59,7 @@ public class FlutterThermalPrinterPlugin implements FlutterPlugin, MethodCallHan
               String vendorId = call.argument("vendorId");
               String productId = call.argument("productId");
               List<Integer> data = call.argument("data");
-              usbPrinter.printText(vendorId, productId, data);
-              result.success(true);
+              result.success(usbPrinter.printText(vendorId, productId, data));
               break;
           }
           case "isConnected": {
@@ -78,5 +77,6 @@ public class FlutterThermalPrinterPlugin implements FlutterPlugin, MethodCallHan
   @Override
   public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
     channel.setMethodCallHandler(null);
+    eventChannel.setStreamHandler(null);
   }
 }

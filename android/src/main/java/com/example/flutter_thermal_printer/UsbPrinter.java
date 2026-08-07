@@ -100,7 +100,9 @@ public class UsbPrinter implements EventChannel.StreamHandler {
         deviceData.put("productId", String.valueOf(device.getProductId()));
         deviceData.put("connected", isConnected);
         Log.d(TAG, "Sending device data: " + deviceData);
-        events.success(deviceData);
+        if (events != null) {
+            events.success(deviceData);
+        }
     }
 
 
@@ -199,24 +201,41 @@ public class UsbPrinter implements EventChannel.StreamHandler {
     }
 
     //    Print text on the printer
-    public void printText(String vendorId, String productId, List<Integer> bytes) {
+    public boolean printText(String vendorId, String productId, List<Integer> bytes) {
         UsbManager m = (UsbManager) context.getSystemService(USB_SERVICE);
         UsbDevice device = findDevice(vendorId, productId);
         if (device == null) {
-            return;
+            Log.d(TAG, "Cannot print. Device not found. vendorId=" + vendorId + ", productId=" + productId);
+            return false;
+        }
+        if (bytes == null || bytes.isEmpty()) {
+            Log.d(TAG, "Cannot print. Data is empty.");
+            return false;
         }
         if (!m.hasPermission(device)) {
             m.requestPermission(device, mPermissionIntent);
         }
         if (!m.hasPermission(device)) {
-            return;
+            Log.d(TAG, "Cannot print. Permission is not granted.");
+            return false;
         }
         UsbDeviceConnection connection = m.openDevice(device);
 
         if (connection == null) {
-            return;
+            Log.d(TAG, "Cannot print. Failed to open USB device.");
+            return false;
         }
-        connection.claimInterface(device.getInterface(0), true);
+        if (device.getInterfaceCount() == 0) {
+            Log.d(TAG, "Cannot print. USB device has no interfaces.");
+            connection.close();
+            return false;
+        }
+        boolean interfaceClaimed = connection.claimInterface(device.getInterface(0), true);
+        if (!interfaceClaimed) {
+            Log.d(TAG, "Cannot print. Failed to claim USB interface.");
+            connection.close();
+            return false;
+        }
         UsbEndpoint mBulkEndOut = null;
         for (int i = 0; i < device.getInterface(0).getEndpointCount(); i++) {
             if (device.getInterface(0).getEndpoint(i).getType() == UsbConstants.USB_ENDPOINT_XFER_BULK && device.getInterface(0).getEndpoint(i).getDirection() == UsbConstants.USB_DIR_OUT) {
@@ -224,13 +243,20 @@ public class UsbPrinter implements EventChannel.StreamHandler {
                 break;
             }
         }
+        if (mBulkEndOut == null) {
+            Log.d(TAG, "Cannot print. Bulk OUT endpoint not found.");
+            connection.releaseInterface(device.getInterface(0));
+            connection.close();
+            return false;
+        }
         byte[] data = new byte[bytes.size()];
         for (int i = 0; i < bytes.size(); i++) {
             data[i] = bytes.get(i).byteValue();
         }
-        connection.bulkTransfer(mBulkEndOut, data, data.length, 5000);
+        int transferred = connection.bulkTransfer(mBulkEndOut, data, data.length, 5000);
         connection.releaseInterface(device.getInterface(0));
         connection.close();
+        return transferred >= 0;
     }
 
     public boolean isConnected(String vendorId, String productId) {
@@ -255,6 +281,13 @@ public class UsbPrinter implements EventChannel.StreamHandler {
         }
         //  Release the interface
         UsbDeviceConnection connection = m.openDevice(device);
+        if (connection == null) {
+            return false;
+        }
+        if (device.getInterfaceCount() == 0) {
+            connection.close();
+            return false;
+        }
         connection.releaseInterface(device.getInterface(0));
         connection.close();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
@@ -263,7 +296,9 @@ public class UsbPrinter implements EventChannel.StreamHandler {
             deviceData.put("vendorId", String.valueOf(device.getVendorId()));
             deviceData.put("productId", String.valueOf(device.getProductId()));
             deviceData.put("connected", m.hasPermission(device));
-            events.success(deviceData);
+            if (events != null) {
+                events.success(deviceData);
+            }
         }
         return true;
     }
