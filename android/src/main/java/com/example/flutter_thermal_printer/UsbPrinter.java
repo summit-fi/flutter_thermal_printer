@@ -142,24 +142,47 @@ public class UsbPrinter implements EventChannel.StreamHandler {
 
     private Integer requestingPermission = 0;
 
+    private UsbDevice findDevice(String vendorId, String productId) {
+        UsbManager m = (UsbManager) context.getSystemService(USB_SERVICE);
+        HashMap<String, UsbDevice> usbDevices = m.getDeviceList();
+
+        for (Map.Entry<String, UsbDevice> entry : usbDevices.entrySet()) {
+            UsbDevice device = entry.getValue();
+            if (usbIdMatches(vendorId, device.getVendorId()) && usbIdMatches(productId, device.getProductId())) {
+                return device;
+            }
+        }
+
+        return null;
+    }
+
+    private boolean usbIdMatches(String value, int actualId) {
+        if (value == null) {
+            return false;
+        }
+
+        String normalized = value.trim();
+        if (normalized.isEmpty()) {
+            return false;
+        }
+
+        String lower = normalized.toLowerCase();
+        String decimal = String.valueOf(actualId);
+        String hex = Integer.toHexString(actualId);
+        String paddedHex = String.format("%04x", actualId);
+
+        return lower.equals(decimal) || lower.equals(hex) || lower.equals(paddedHex) || lower.equals("0x" + hex) || lower.equals("0x" + paddedHex);
+    }
+
     //    Connect using VendorId and ProductId
     public boolean connect(String vendorId, String productId) {
         connectionVendorId = vendorId;
         connectionProductId = productId;
         UsbManager m = (UsbManager) context.getSystemService(Context.USB_SERVICE);
-        HashMap<String, UsbDevice> usbDevices = m.getDeviceList();
-        UsbDevice device = null;
-
-        for (Map.Entry<String, UsbDevice> entry : usbDevices.entrySet()) {
-            if (String.valueOf(entry.getValue().getVendorId()).equals(vendorId) &&
-                    String.valueOf(entry.getValue().getProductId()).equals(productId)) {
-                device = entry.getValue();
-                break;
-            }
-        }
+        UsbDevice device = findDevice(vendorId, productId);
 
         if (device == null) {
-            Log.d(TAG, "Device not found.");
+            Log.d(TAG, "Device not found. vendorId=" + vendorId + ", productId=" + productId);
             return false;
         }
 
@@ -178,14 +201,7 @@ public class UsbPrinter implements EventChannel.StreamHandler {
     //    Print text on the printer
     public void printText(String vendorId, String productId, List<Integer> bytes) {
         UsbManager m = (UsbManager) context.getSystemService(USB_SERVICE);
-        HashMap<String, UsbDevice> usbDevices = m.getDeviceList();
-        UsbDevice device = null;
-        for (Map.Entry<String, UsbDevice> entry : usbDevices.entrySet()) {
-            if (String.valueOf(entry.getValue().getVendorId()).equals(vendorId) && String.valueOf(entry.getValue().getProductId()).equals(productId)) {
-                device = entry.getValue();
-                break;
-            }
-        }
+        UsbDevice device = findDevice(vendorId, productId);
         if (device == null) {
             return;
         }
@@ -219,14 +235,7 @@ public class UsbPrinter implements EventChannel.StreamHandler {
 
     public boolean isConnected(String vendorId, String productId) {
         UsbManager m = (UsbManager) context.getSystemService(USB_SERVICE);
-        HashMap<String, UsbDevice> usbDevices = m.getDeviceList();
-        UsbDevice device = null;
-        for (Map.Entry<String, UsbDevice> entry : usbDevices.entrySet()) {
-            if (String.valueOf(entry.getValue().getVendorId()).equals(vendorId) && String.valueOf(entry.getValue().getProductId()).equals(productId)) {
-                device = entry.getValue();
-                break;
-            }
-        }
+        UsbDevice device = findDevice(vendorId, productId);
         if (device == null) {
             return false;
         }
@@ -236,14 +245,7 @@ public class UsbPrinter implements EventChannel.StreamHandler {
 
     public boolean disconnect(String vendorId, String productId) {
         UsbManager m = (UsbManager) context.getSystemService(USB_SERVICE);
-        HashMap<String, UsbDevice> usbDevices = m.getDeviceList();
-        UsbDevice device = null;
-        for (Map.Entry<String, UsbDevice> entry : usbDevices.entrySet()) {
-            if (String.valueOf(entry.getValue().getVendorId()).equals(vendorId) && String.valueOf(entry.getValue().getProductId()).equals(productId)) {
-                device = entry.getValue();
-                break;
-            }
-        }
+        UsbDevice device = findDevice(vendorId, productId);
         if (device == null) {
             return false;
         }
