@@ -32,6 +32,8 @@ class MethodChannelFlutterThermalPrinter extends FlutterThermalPrinterPlatform {
     String? path,
   }) async =>
       await methodChannel.invokeMethod('printText', {
+        'connectionType': device.connectionType?.name,
+        'address': device.address,
         'vendorId': device.vendorId.toString(),
         'productId': device.productId.toString(),
         'name': device.name,
@@ -51,8 +53,5 @@ class MethodChannelFlutterThermalPrinter extends FlutterThermalPrinterPlatform {
 
   @override
   Future<bool> disconnect(Printer device) async =>
-      await methodChannel.invokeMethod('disconnect', {
-        'vendorId': device.vendorId.toString(),
-        'productId': device.productId.toString(),
-      });
+      await methodChannel.invokeMethod('disconnect', device.toJson());
 }

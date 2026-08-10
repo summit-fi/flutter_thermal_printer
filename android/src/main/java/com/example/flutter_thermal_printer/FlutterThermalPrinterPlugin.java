@@ -1,10 +1,15 @@
 package com.example.flutter_thermal_printer;
 
 import android.content.Context;
+import android.os.Handler;
+import android.os.Looper;
 
 import androidx.annotation.NonNull;
 
 import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
 import io.flutter.plugin.common.MethodCall;
@@ -23,6 +28,9 @@ public class FlutterThermalPrinterPlugin implements FlutterPlugin, MethodCallHan
   private EventChannel eventChannel;
   private Context context;
   private UsbPrinter usbPrinter;
+  private BluetoothClassicPrinter bluetoothClassicPrinter;
+  private final ExecutorService executor = Executors.newSingleThreadExecutor();
+  private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
   @Override
   public void onAttachedToEngine(@NonNull FlutterPluginBinding flutterPluginBinding) {
@@ -31,6 +39,7 @@ public class FlutterThermalPrinterPlugin implements FlutterPlugin, MethodCallHan
     channel.setMethodCallHandler(this);
     context = flutterPluginBinding.getApplicationContext();
     usbPrinter = new UsbPrinter(context); 
+    bluetoothClassicPrinter = new BluetoothClassicPrinter(context);
     eventChannel.setStreamHandler(usbPrinter);
   }
 
@@ -44,28 +53,48 @@ public class FlutterThermalPrinterPlugin implements FlutterPlugin, MethodCallHan
               result.success(usbPrinter.getUsbDevicesList());
               break;
           case "connect": {
-              String vendorId = call.argument("vendorId");
-              String productId = call.argument("productId");
-              result.success(usbPrinter.connect(vendorId, productId));
+              if (isBluetoothClassic(call)) {
+                  String address = call.argument("address");
+                  runBooleanAsync(result, () -> bluetoothClassicPrinter.connect(address));
+              } else {
+                  String vendorId = call.argument("vendorId");
+                  String productId = call.argument("productId");
+                  result.success(usbPrinter.connect(vendorId, productId));
+              }
               break;
           }
           case "disconnect": {
-              String vendorId = call.argument("vendorId");
-              String productId = call.argument("productId");
-              result.success(usbPrinter.disconnect(vendorId, productId));
+              if (isBluetoothClassic(call)) {
+                  String address = call.argument("address");
+                  runBooleanAsync(result, () -> bluetoothClassicPrinter.disconnect(address));
+              } else {
+                  String vendorId = call.argument("vendorId");
+                  String productId = call.argument("productId");
+                  result.success(usbPrinter.disconnect(vendorId, productId));
+              }
               break;
           }
           case "printText": {
-              String vendorId = call.argument("vendorId");
-              String productId = call.argument("productId");
               List<Integer> data = call.argument("data");
-              result.success(usbPrinter.printText(vendorId, productId, data));
+              if (isBluetoothClassic(call)) {
+                  String address = call.argument("address");
+                  runBooleanAsync(result, () -> bluetoothClassicPrinter.printText(address, data));
+              } else {
+                  String vendorId = call.argument("vendorId");
+                  String productId = call.argument("productId");
+                  result.success(usbPrinter.printText(vendorId, productId, data));
+              }
               break;
           }
           case "isConnected": {
-              String vendorId = call.argument("vendorId");
-              String productId = call.argument("productId");
-              result.success(usbPrinter.isConnected(vendorId, productId));
+              if (isBluetoothClassic(call)) {
+                  String address = call.argument("address");
+                  runBooleanAsync(result, () -> bluetoothClassicPrinter.isConnected(address));
+              } else {
+                  String vendorId = call.argument("vendorId");
+                  String productId = call.argument("productId");
+                  result.success(usbPrinter.isConnected(vendorId, productId));
+              }
               break;
           }
           default:
@@ -78,5 +107,22 @@ public class FlutterThermalPrinterPlugin implements FlutterPlugin, MethodCallHan
   public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
     channel.setMethodCallHandler(null);
     eventChannel.setStreamHandler(null);
+    executor.shutdownNow();
+  }
+
+  private boolean isBluetoothClassic(MethodCall call) {
+      String connectionType = call.argument("connectionType");
+      return "BLUETOOTH_CLASSIC".equals(connectionType);
+  }
+
+  private void runBooleanAsync(Result result, Callable<Boolean> task) {
+      executor.execute(() -> {
+          try {
+              Boolean success = task.call();
+              mainHandler.post(() -> result.success(success));
+          } catch (Exception error) {
+              mainHandler.post(() -> result.error("BLUETOOTH_CLASSIC_ERROR", error.getMessage(), null));
+          }
+      });
   }
 }

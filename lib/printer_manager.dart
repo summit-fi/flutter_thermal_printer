@@ -110,6 +110,8 @@ class PrinterManager {
       } else {
         return FlutterThermalPrinterPlatform.instance.connect(device);
       }
+    } else if (device.connectionType == ConnectionType.BLUETOOTH_CLASSIC) {
+      return FlutterThermalPrinterPlatform.instance.connect(device);
     } else if (device.connectionType == ConnectionType.BLE) {
       try {
         if (device.address == null) {
@@ -184,6 +186,8 @@ class PrinterManager {
       } else {
         return FlutterThermalPrinterPlatform.instance.isConnected(device);
       }
+    } else if (device.connectionType == ConnectionType.BLUETOOTH_CLASSIC) {
+      return FlutterThermalPrinterPlatform.instance.isConnected(device);
     } else if (device.connectionType == ConnectionType.BLE) {
       try {
         if (device.address == null) {
@@ -200,7 +204,9 @@ class PrinterManager {
 
   /// Disconnect from a printer device
   Future<void> disconnect(Printer device) async {
-    if (device.connectionType == ConnectionType.BLE) {
+    if (device.connectionType == ConnectionType.BLUETOOTH_CLASSIC) {
+      await FlutterThermalPrinterPlatform.instance.disconnect(device);
+    } else if (device.connectionType == ConnectionType.BLE) {
       try {
         if (device.address != null) {
           await device.disconnect();
@@ -250,6 +256,12 @@ class PrinterManager {
           log('FlutterThermalPrinter: Unable to Print Data $e');
         }
       }
+    } else if (printer.connectionType == ConnectionType.BLUETOOTH_CLASSIC) {
+      await FlutterThermalPrinterPlatform.instance.printText(
+        printer,
+        Uint8List.fromList(bytes),
+      );
+      return;
     } else if (printer.connectionType == ConnectionType.BLE) {
       try {
         final services = await printer.discoverServices();
@@ -281,7 +293,8 @@ class PrinterManager {
             (Platform.isWindows
                 ? 50
                 : await printer.requestMtu(
-                    Platform.isMacOS || Platform.isLinux ? 150 : 500));
+                    Platform.isMacOS || Platform.isLinux ? 150 : 500,
+                  ));
         final maxChunkSize = mtu - 3;
 
         for (var i = 0; i < bytes.length; i += maxChunkSize) {
