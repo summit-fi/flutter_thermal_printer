@@ -10,6 +10,7 @@ import 'package:universal_ble/universal_ble.dart';
 import 'Windows/windows_platform.dart'
     if (dart.library.html) 'Windows/windows_stub.dart';
 import 'flutter_thermal_printer_platform_interface.dart';
+import 'network/network_printer.dart';
 import 'utils/ble_config.dart';
 import 'utils/printer.dart';
 
@@ -173,6 +174,9 @@ class PrinterManager {
         log('Failed to connect to BLE device: $e');
         return false;
       }
+    } else if (device.connectionType == ConnectionType.NETWORK) {
+      // TCP network printers connect on demand in printData; nothing to do here.
+      return true;
     }
     return false;
   }
@@ -198,6 +202,8 @@ class PrinterManager {
         log('Failed to check connection status: $e');
         return false;
       }
+    } else if (device.connectionType == ConnectionType.NETWORK) {
+      return true;
     }
     return false;
   }
@@ -320,6 +326,20 @@ class PrinterManager {
         return;
       } catch (e) {
         log('Failed to print data to device $e');
+      }
+    } else if (printer.connectionType == ConnectionType.NETWORK) {
+      final parts = (printer.address ?? '').split(':');
+      final host = parts.isNotEmpty ? parts[0] : '';
+      final port = parts.length > 1 ? int.tryParse(parts[1]) ?? 9100 : 9100;
+      if (host.isEmpty) {
+        log('NETWORK printer has no host address');
+        return;
+      }
+      try {
+        final networkPrinter = FlutterThermalPrinterNetwork(host, port: port);
+        await networkPrinter.printTicket(bytes);
+      } catch (e) {
+        log('Failed to print to network printer $host:$port — $e');
       }
     }
   }
