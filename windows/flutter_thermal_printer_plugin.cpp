@@ -5,6 +5,14 @@
 #include <windows.h>
 #include <VersionHelpers.h>
 
+#ifdef min
+#undef min
+#endif
+
+#ifdef max
+#undef max
+#endif
+
 #include <flutter/method_channel.h>
 #include <flutter/plugin_registrar_windows.h>
 #include <flutter/standard_method_codec.h>
@@ -153,9 +161,25 @@ bool FlutterThermalPrinterPlugin::ConnectBluetoothClassic(const std::string& add
 
   {
     std::lock_guard lock(bluetooth_sockets_mutex_);
-    if (bluetooth_sockets_.find(normalized_address) != bluetooth_sockets_.end()) {
-      BluetoothLog(L"connect.reused address=" + WideFromUtf8(normalized_address));
-      return true;
+    const auto socket_iterator = bluetooth_sockets_.find(normalized_address);
+    if (socket_iterator != bluetooth_sockets_.end()) {
+      int socket_error = 0;
+      int socket_error_size = sizeof(socket_error);
+      const auto status = getsockopt(
+          socket_iterator->second,
+          SOL_SOCKET,
+          SO_ERROR,
+          reinterpret_cast<char*>(&socket_error),
+          &socket_error_size);
+      if (status == 0 && socket_error == 0) {
+        BluetoothLog(L"connect.reused address=" + WideFromUtf8(normalized_address));
+        return true;
+      }
+      BluetoothLog(L"connect.stale address=" + WideFromUtf8(normalized_address) +
+                   L" error=" + std::to_wstring(socket_error));
+      shutdown(socket_iterator->second, SD_BOTH);
+      closesocket(socket_iterator->second);
+      bluetooth_sockets_.erase(socket_iterator);
     }
   }
 
@@ -181,9 +205,10 @@ bool FlutterThermalPrinterPlugin::ConnectBluetoothClassic(const std::string& add
   BluetoothLog(L"connect.started address=" + WideFromUtf8(normalized_address));
   const int connect_result = connect(
       socket_handle, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
-  if (connect_result == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK &&
-      WSAGetLastError() != WSAEINPROGRESS) {
-    BluetoothLog(L"connect.failed reason=connect error=" + std::to_wstring(WSAGetLastError()));
+  const int connect_error = connect_result == SOCKET_ERROR ? WSAGetLastError() : 0;
+  if (connect_result == SOCKET_ERROR && connect_error != WSAEWOULDBLOCK &&
+      connect_error != WSAEINPROGRESS) {
+    BluetoothLog(L"connect.failed reason=connect error=" + std::to_wstring(connect_error));
     closesocket(socket_handle);
     return false;
   }
@@ -251,7 +276,26 @@ bool FlutterThermalPrinterPlugin::PrintBluetoothClassic(
 bool FlutterThermalPrinterPlugin::IsBluetoothClassicConnected(const std::string& address) {
   const auto normalized_address = NormalizeAddress(address);
   std::lock_guard lock(bluetooth_sockets_mutex_);
-  const bool connected = bluetooth_sockets_.find(normalized_address) != bluetooth_sockets_.end();
+  const auto socket_iterator = bluetooth_sockets_.find(normalized_address);
+  if (socket_iterator == bluetooth_sockets_.end()) {
+    BluetoothLog(L"connection.checked address=" + WideFromUtf8(normalized_address) + L" connected=0");
+    return false;
+  }
+
+  int socket_error = 0;
+  int socket_error_size = sizeof(socket_error);
+  const auto status = getsockopt(
+      socket_iterator->second,
+      SOL_SOCKET,
+      SO_ERROR,
+      reinterpret_cast<char*>(&socket_error),
+      &socket_error_size);
+  const bool connected = status == 0 && socket_error == 0;
+  if (!connected) {
+    shutdown(socket_iterator->second, SD_BOTH);
+    closesocket(socket_iterator->second);
+    bluetooth_sockets_.erase(socket_iterator);
+  }
   BluetoothLog(L"connection.checked address=" + WideFromUtf8(normalized_address) +
                L" connected=" + std::to_wstring(connected));
   return connected;
