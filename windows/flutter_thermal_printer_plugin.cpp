@@ -37,9 +37,14 @@ using flutter::EncodableValue;
 constexpr auto kBluetoothConnectTimeout = std::chrono::seconds(10);
 constexpr int kBluetoothWriteTimeoutMs = 10'000;
 constexpr size_t kBluetoothWriteChunkSize = 1'024;
+constexpr DWORD kUsbWriteTimeoutMs = 10'000;
 
 void BluetoothLog(const std::wstring& message) {
   OutputDebugStringW((L"[FlutterThermalPrinterNative] windows.bluetooth " + message + L"\n").c_str());
+}
+
+void UsbLog(const std::wstring& message) {
+  OutputDebugStringW((L"[FlutterThermalPrinterNative] windows.usb " + message + L"\n").c_str());
 }
 
 std::wstring WideFromUtf8(const std::string& value) {
@@ -313,12 +318,128 @@ bool FlutterThermalPrinterPlugin::DisconnectBluetoothClassic(const std::string& 
   return true;
 }
 
+bool FlutterThermalPrinterPlugin::CanOpenUsbPrinter(const std::string& device_path) {
+  const auto wide_path = WideFromUtf8(device_path);
+  if (wide_path.empty()) {
+    UsbLog(L"open.failed reason=empty_path");
+    return false;
+  }
+
+  const auto handle = CreateFileW(
+      wide_path.c_str(),
+      GENERIC_WRITE,
+      0,
+      nullptr,
+      OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+      nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
+    UsbLog(L"open.failed error=" + std::to_wstring(GetLastError()));
+    return false;
+  }
+
+  CloseHandle(handle);
+  UsbLog(L"open.success");
+  return true;
+}
+
+bool FlutterThermalPrinterPlugin::PrintUsbPrinter(
+    const std::string& device_path,
+    const std::vector<uint8_t>& bytes) {
+  if (bytes.empty()) {
+    UsbLog(L"print.skipped reason=empty_data");
+    return true;
+  }
+
+  const auto wide_path = WideFromUtf8(device_path);
+  if (wide_path.empty()) {
+    UsbLog(L"print.failed reason=empty_path");
+    return false;
+  }
+
+  const auto handle = CreateFileW(
+      wide_path.c_str(),
+      GENERIC_WRITE,
+      0,
+      nullptr,
+      OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+      nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
+    UsbLog(L"print.failed stage=open error=" + std::to_wstring(GetLastError()));
+    return false;
+  }
+
+  HANDLE completion_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (completion_event == nullptr) {
+    UsbLog(L"print.failed stage=create_event error=" + std::to_wstring(GetLastError()));
+    CloseHandle(handle);
+    return false;
+  }
+
+  constexpr size_t kUsbWriteChunkSize = 4 * 1024;
+  size_t offset = 0;
+  bool success = true;
+  UsbLog(L"print.started bytes=" + std::to_wstring(bytes.size()));
+  while (offset < bytes.size()) {
+    const auto remaining = bytes.size() - offset;
+    const auto chunk_size = static_cast<DWORD>(std::min(remaining, kUsbWriteChunkSize));
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = completion_event;
+    ResetEvent(completion_event);
+
+    DWORD written = 0;
+    const auto write_started = WriteFile(
+        handle,
+        bytes.data() + offset,
+        chunk_size,
+        &written,
+        &overlapped);
+    if (write_started == FALSE) {
+      const auto write_error = GetLastError();
+      if (write_error != ERROR_IO_PENDING) {
+        UsbLog(L"print.failed stage=write offset=" + std::to_wstring(offset) +
+               L" error=" + std::to_wstring(write_error));
+        success = false;
+        break;
+      }
+
+      const auto wait_result = WaitForSingleObject(completion_event, kUsbWriteTimeoutMs);
+      if (wait_result != WAIT_OBJECT_0 ||
+          GetOverlappedResult(handle, &overlapped, &written, FALSE) == FALSE) {
+        const auto completion_error = GetLastError();
+        CancelIoEx(handle, &overlapped);
+        UsbLog(L"print.failed stage=completion offset=" + std::to_wstring(offset) +
+               L" wait=" + std::to_wstring(wait_result) +
+               L" error=" + std::to_wstring(completion_error));
+        success = false;
+        break;
+      }
+    }
+
+    if (written != chunk_size) {
+      UsbLog(L"print.failed stage=partial_write offset=" + std::to_wstring(offset) +
+             L" expected=" + std::to_wstring(chunk_size) +
+             L" actual=" + std::to_wstring(written));
+      success = false;
+      break;
+    }
+    offset += written;
+  }
+
+  CloseHandle(completion_event);
+  CloseHandle(handle);
+  UsbLog(success ? L"print.success bytes=" + std::to_wstring(bytes.size()) : L"print.finished success=0");
+  return success;
+}
+
 void FlutterThermalPrinterPlugin::HandleMethodCall(
     const flutter::MethodCall<flutter::EncodableValue> &method_call,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
   const auto arguments = std::get_if<EncodableMap>(method_call.arguments());
   const auto is_bluetooth_classic = arguments != nullptr &&
       StringValue(*arguments, "connectionType") == "BLUETOOTH_CLASSIC";
+  const auto is_usb = arguments != nullptr && StringValue(*arguments, "connectionType") == "USB";
 
   if (method_call.method_name().compare("getPlatformVersion") == 0) {
     std::ostringstream version_stream;
@@ -340,6 +461,15 @@ void FlutterThermalPrinterPlugin::HandleMethodCall(
     result->Success(EncodableValue(IsBluetoothClassicConnected(StringValue(*arguments, "address"))));
   } else if (method_call.method_name().compare("disconnect") == 0 && is_bluetooth_classic) {
     result->Success(EncodableValue(DisconnectBluetoothClassic(StringValue(*arguments, "address"))));
+  } else if (method_call.method_name().compare("connect") == 0 && is_usb) {
+    result->Success(EncodableValue(CanOpenUsbPrinter(StringValue(*arguments, "address"))));
+  } else if (method_call.method_name().compare("printText") == 0 && is_usb) {
+    result->Success(EncodableValue(PrintUsbPrinter(
+        StringValue(*arguments, "address"), BytesValue(*arguments, "data"))));
+  } else if (method_call.method_name().compare("isConnected") == 0 && is_usb) {
+    result->Success(EncodableValue(CanOpenUsbPrinter(StringValue(*arguments, "address"))));
+  } else if (method_call.method_name().compare("disconnect") == 0 && is_usb) {
+    result->Success(EncodableValue(true));
   } else {
     result->NotImplemented();
   }

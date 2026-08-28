@@ -104,7 +104,8 @@ class Printer extends BleDevice {
   bool get hasValidConnectionData {
     switch (connectionType) {
       case ConnectionType.USB:
-        return vendorId != null && productId != null;
+        return (vendorId != null && productId != null) ||
+            (address?.startsWith(r'\\?\') ?? false);
       case ConnectionType.BLE:
         return address != null;
       case ConnectionType.NETWORK:

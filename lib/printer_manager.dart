@@ -97,12 +97,8 @@ class PrinterManager {
   /// before considering it stable. Defaults to [BleConfig.connectionStabilizationDelay].
   Future<bool> connect(Printer device, {Duration? connectionStabilizationDelay}) async {
     if (device.connectionType == ConnectionType.USB) {
-      if (Platform.isWindows) {
-        // Windows USB connection - device is already available, no connection needed
-        return true;
-      } else {
-        return FlutterThermalPrinterPlatform.instance.connect(device);
-      }
+      if (Platform.isWindows && !_usesWindowsUsbDevicePath(device)) return true;
+      return FlutterThermalPrinterPlatform.instance.connect(device);
     } else if (device.connectionType == ConnectionType.BLUETOOTH_CLASSIC) {
       return FlutterThermalPrinterPlatform.instance.connect(device);
     } else if (device.connectionType == ConnectionType.BLE) {
@@ -167,12 +163,8 @@ class PrinterManager {
   /// Check if a device is connected
   Future<bool> isConnected(Printer device) async {
     if (device.connectionType == ConnectionType.USB) {
-      if (Platform.isWindows) {
-        // For Windows USB printers, they're always "connected" if they're available
-        return true;
-      } else {
-        return FlutterThermalPrinterPlatform.instance.isConnected(device);
-      }
+      if (Platform.isWindows && !_usesWindowsUsbDevicePath(device)) return true;
+      return FlutterThermalPrinterPlatform.instance.isConnected(device);
     } else if (device.connectionType == ConnectionType.BLUETOOTH_CLASSIC) {
       return FlutterThermalPrinterPlatform.instance.isConnected(device);
     } else if (device.connectionType == ConnectionType.BLE) {
@@ -219,7 +211,19 @@ class PrinterManager {
   Future<bool> printData(Printer printer, List<int> bytes, {bool longData = false, int? chunkSize}) async {
     if (printer.connectionType == ConnectionType.USB) {
       if (Platform.isWindows) {
-        // Windows USB printing using Win32 API
+        if (_usesWindowsUsbDevicePath(printer)) {
+          try {
+            return await FlutterThermalPrinterPlatform.instance.printText(
+              printer,
+              Uint8List.fromList(bytes),
+              path: printer.address,
+            );
+          } catch (error) {
+            log('FlutterThermalPrinter: Unable to write to Windows USB printer $error');
+            return false;
+          }
+        }
+
         using((alloc) {
           RawPrinter(printer.name!, alloc).printEscPosWin32(bytes);
         });
@@ -312,6 +316,9 @@ class PrinterManager {
     }
     return false;
   }
+
+  bool _usesWindowsUsbDevicePath(Printer printer) =>
+      printer.address?.startsWith(r'\\?\') ?? false;
 
   /// Get Printers from BT and USB
   Future<void> getPrinters({

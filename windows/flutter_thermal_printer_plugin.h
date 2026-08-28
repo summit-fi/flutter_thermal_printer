@@ -41,6 +41,8 @@ class FlutterThermalPrinterPlugin : public flutter::Plugin {
   bool PrintBluetoothClassic(const std::string& address, const std::vector<uint8_t>& bytes);
   bool IsBluetoothClassicConnected(const std::string& address);
   bool DisconnectBluetoothClassic(const std::string& address);
+  bool CanOpenUsbPrinter(const std::string& device_path);
+  bool PrintUsbPrinter(const std::string& device_path, const std::vector<uint8_t>& bytes);
 
   std::unordered_map<std::string, SOCKET> bluetooth_sockets_;
   std::mutex bluetooth_sockets_mutex_;
