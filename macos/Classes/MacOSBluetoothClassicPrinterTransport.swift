@@ -4,6 +4,7 @@ import IOBluetooth
 final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMChannelDelegate {
   private var channelsByAddress = [String: IOBluetoothRFCOMMChannel]()
   private var pendingConnections = [String: MacOSBluetoothSdpQuery]()
+  private var pendingWrites = [String: PendingWrite]()
 
   func connect(address: String, completion: @escaping (Result<Void, Error>) -> Void) {
     let normalizedAddress = normalize(address)
@@ -63,30 +64,58 @@ final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMCh
     log("disconnect.completed address=\(normalizedAddress) status=\(status)")
   }
 
-  func write(data: Data, address: String) -> Result<Void, Error> {
+  // Sends data asynchronously chunk-by-chunk using writeAsync + delegate callback.
+  // Each chunk is sent only after the previous write completes, providing flow control
+  // and avoiding RFCOMM buffer overflow that occurs with writeSync loops.
+  func write(data: Data, address: String, completion: @escaping (Result<Void, Error>) -> Void) {
     let normalizedAddress = normalize(address)
-    guard let channel = channelsByAddress[normalizedAddress], channel.isOpen() else {
-      return .failure(MacOSBluetoothTransportError.channelUnavailable(normalizedAddress))
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      guard let channel = self.channelsByAddress[normalizedAddress], channel.isOpen() else {
+        completion(.failure(MacOSBluetoothTransportError.channelUnavailable(normalizedAddress)))
+        return
+      }
+      guard self.pendingWrites[normalizedAddress] == nil else {
+        completion(.failure(MacOSBluetoothTransportError.writeAlreadyInProgress))
+        return
+      }
+      let mtu = max(1, Int(channel.getMTU()))
+      self.log("write.started address=\(normalizedAddress) bytes=\(data.count) mtu=\(mtu)")
+      self.pendingWrites[normalizedAddress] = PendingWrite(
+        nsData: data as NSData,
+        chunkSize: min(mtu, 512),
+        offset: 0,
+        completion: completion
+      )
+      self.sendNextChunk(address: normalizedAddress, channel: channel)
+    }
+  }
+
+  // MARK: - Private
+
+  private func sendNextChunk(address: String, channel: IOBluetoothRFCOMMChannel) {
+    guard let pending = pendingWrites[address] else { return }
+
+    if pending.offset >= pending.totalBytes {
+      pendingWrites.removeValue(forKey: address)
+      log("write.completed address=\(address) bytes=\(pending.totalBytes)")
+      pending.completion(.success(()))
+      return
     }
 
-    let mtu = max(1, Int(channel.getMTU()))
-    let chunkSize = min(mtu, 512)
-    log("write.started address=\(normalizedAddress) bytes=\(data.count) mtu=\(mtu) chunkSize=\(chunkSize)")
-    var offset = 0
-    while offset < data.count {
-      let end = min(offset + chunkSize, data.count)
-      let chunk = data.subdata(in: offset..<end)
-      let status = chunk.withUnsafeBytes { buffer in
-        channel.writeSync(UnsafeMutableRawPointer(mutating: buffer.baseAddress), length: UInt16(chunk.count))
-      }
-      guard status == kIOReturnSuccess else {
-        log("write.failed address=\(normalizedAddress) offset=\(offset) status=\(status)")
-        return .failure(MacOSBluetoothTransportError.writeFailed(status))
-      }
-      offset = end
+    let chunkLength = min(pending.chunkSize, pending.totalBytes - pending.offset)
+    let ptr = pending.nsData.bytes.advanced(by: pending.offset)
+    let status = channel.writeAsync(UnsafeMutableRawPointer(mutating: ptr), length: UInt16(chunkLength), refcon: nil)
+
+    if status != kIOReturnSuccess {
+      let failed = pendingWrites.removeValue(forKey: address)
+      log("write.failed address=\(address) offset=\(pending.offset) status=\(status)")
+      failed?.completion(.failure(MacOSBluetoothTransportError.writeFailed(status)))
+      return
     }
-    log("write.completed address=\(normalizedAddress) bytes=\(data.count)")
-    return .success(())
+
+    // Advance offset now so the delegate callback sees the updated position.
+    pendingWrites[address]?.offset += chunkLength
   }
 
   private func openChannel(
@@ -106,6 +135,8 @@ final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMCh
     completion(.success(()))
   }
 
+  // MARK: - IOBluetoothRFCOMMChannelDelegate
+
   func rfcommChannelData(
     _ rfcommChannel: IOBluetoothRFCOMMChannel!,
     data dataPointer: UnsafeMutableRawPointer!,
@@ -114,10 +145,38 @@ final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMCh
     log("channel.data_received channel=\(rfcommChannel.getID()) bytes=\(dataLength)")
   }
 
+  func rfcommChannelWriteComplete(
+    _ rfcommChannel: IOBluetoothRFCOMMChannel!,
+    refcon: UnsafeMutableRawPointer!,
+    status: IOReturn
+  ) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self,
+            let entry = self.channelsByAddress.first(where: { $0.value === rfcommChannel })
+      else { return }
+      let address = entry.key
+
+      if status != kIOReturnSuccess {
+        if let failed = self.pendingWrites.removeValue(forKey: address) {
+          self.log("write.failed address=\(address) status=\(status)")
+          failed.completion(.failure(MacOSBluetoothTransportError.writeFailed(status)))
+        }
+        return
+      }
+
+      self.sendNextChunk(address: address, channel: rfcommChannel)
+    }
+  }
+
   func rfcommChannelClosed(_ rfcommChannel: IOBluetoothRFCOMMChannel!) {
     guard let entry = channelsByAddress.first(where: { $0.value === rfcommChannel }) else { return }
     channelsByAddress.removeValue(forKey: entry.key)
-    log("channel.closed address=\(entry.key) channel=\(rfcommChannel.getID())")
+    if let failed = pendingWrites.removeValue(forKey: entry.key) {
+      log("channel.closed address=\(entry.key) channel=\(rfcommChannel.getID()) write_interrupted=true")
+      failed.completion(.failure(MacOSBluetoothTransportError.channelUnavailable(entry.key)))
+    } else {
+      log("channel.closed address=\(entry.key) channel=\(rfcommChannel.getID())")
+    }
   }
 
   private func normalize(_ address: String) -> String {
@@ -127,6 +186,14 @@ final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMCh
   private func log(_ message: String) {
     NSLog("[FlutterThermalPrinterNative] macos.bluetooth \(message)")
   }
+}
+
+private struct PendingWrite {
+  let nsData: NSData
+  let chunkSize: Int
+  var offset: Int
+  let completion: (Result<Void, Error>) -> Void
+  var totalBytes: Int { nsData.length }
 }
 
 private final class MacOSBluetoothSdpQuery: NSObject {
@@ -228,6 +295,7 @@ private enum MacOSBluetoothTransportError: LocalizedError {
   case channelOpenFailed(IOReturn)
   case channelUnavailable(String)
   case writeFailed(IOReturn)
+  case writeAlreadyInProgress
   case connectionCancelled
 
   var errorDescription: String? {
@@ -254,6 +322,8 @@ private enum MacOSBluetoothTransportError: LocalizedError {
       return "Bluetooth printer \(address) is not connected."
     case .writeFailed(let status):
       return "Unable to send data to the Bluetooth printer: \(status)."
+    case .writeAlreadyInProgress:
+      return "A Bluetooth write operation is already in progress."
     case .connectionCancelled:
       return "Bluetooth connection was cancelled."
     }

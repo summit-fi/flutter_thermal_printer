@@ -50,7 +50,7 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
         case "printText":
             let args = call.arguments as? [String: Any]
             if isBluetoothClassic(args) {
-                result(printBluetoothClassic(args: args))
+                printBluetoothClassic(args: args, result: result)
                 return
             }
             let printerName = args?["name"] as? String ?? ""
@@ -109,24 +109,28 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
         }
     }
 
-    private func printBluetoothClassic(args: [String: Any]?) -> Bool {
+    private func printBluetoothClassic(args: [String: Any]?, result: @escaping FlutterResult) {
         guard let address = args?["address"] as? String, !address.isEmpty else {
             bluetoothLog("print.failed reason=missing_address")
-            return false
+            result(false)
+            return
         }
         let bytes = args?["data"] as? [Int] ?? []
         let data = Data(bytes.map { UInt8(truncatingIfNeeded: $0) })
         guard !data.isEmpty else {
             bluetoothLog("print.skipped address=\(address) reason=empty_data")
-            return true
+            result(true)
+            return
         }
-        switch bluetoothTransport.write(data: data, address: address) {
-        case .success:
-            bluetoothLog("print.success address=\(address) bytes=\(data.count)")
-            return true
-        case .failure(let error):
-            bluetoothLog("print.failed address=\(address) bytes=\(data.count) error=\(error.localizedDescription)")
-            return false
+        bluetoothTransport.write(data: data, address: address) { [weak self] writeResult in
+            switch writeResult {
+            case .success:
+                self?.bluetoothLog("print.success address=\(address) bytes=\(data.count)")
+                result(true)
+            case .failure(let error):
+                self?.bluetoothLog("print.failed address=\(address) bytes=\(data.count) error=\(error.localizedDescription)")
+                result(false)
+            }
         }
     }
 
