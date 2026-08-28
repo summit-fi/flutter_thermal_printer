@@ -62,8 +62,8 @@ std::vector<uint8_t> BytesValue(const EncodableMap& map, const char* key) {
   for (const auto& value : *list) {
     if (const auto integer = std::get_if<int32_t>(&value)) {
       bytes.push_back(static_cast<uint8_t>(*integer));
-    } else if (const auto integer = std::get_if<int64_t>(&value)) {
-      bytes.push_back(static_cast<uint8_t>(*integer));
+    } else if (const auto long_integer = std::get_if<int64_t>(&value)) {
+      bytes.push_back(static_cast<uint8_t>(*long_integer));
     }
   }
   return bytes;
