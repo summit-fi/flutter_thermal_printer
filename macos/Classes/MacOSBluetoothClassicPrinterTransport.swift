@@ -143,7 +143,34 @@ private final class MacOSBluetoothSdpQuery: NSObject {
   }
 
   func start() {
+    if device.isConnected() {
+      beginSdpQuery()
+      return
+    }
+
+    let connectionStatus = device.openConnection(self)
+    NSLog(
+      "[FlutterThermalPrinterNative] macos.bluetooth baseband.started address=\(device.addressString ?? "unknown") " +
+        "status=\(connectionStatus)"
+    )
+    if connectionStatus != kIOReturnSuccess {
+      complete(.failure(MacOSBluetoothTransportError.basebandStartFailed(connectionStatus)))
+    }
+  }
+
+  @objc(connectionComplete:status:)
+  func connectionComplete(_ device: IOBluetoothDevice!, status: IOReturn) {
+    NSLog("[FlutterThermalPrinterNative] macos.bluetooth baseband.completed status=\(status)")
+    guard status == kIOReturnSuccess else {
+      complete(.failure(MacOSBluetoothTransportError.basebandConnectionFailed(status)))
+      return
+    }
+    beginSdpQuery()
+  }
+
+  private func beginSdpQuery() {
     let status = device.performSDPQuery(self)
+    NSLog("[FlutterThermalPrinterNative] macos.bluetooth sdp.requested status=\(status)")
     if status != kIOReturnSuccess {
       complete(.failure(MacOSBluetoothTransportError.sdpStartFailed(status)))
     }
@@ -153,7 +180,9 @@ private final class MacOSBluetoothSdpQuery: NSObject {
     complete(.failure(MacOSBluetoothTransportError.connectionCancelled))
   }
 
-  @objc func sdpQueryComplete(_ sender: IOBluetoothDevice!, status: IOReturn) {
+  @objc(sdpQueryComplete:status:)
+  func sdpQueryComplete(_ sender: IOBluetoothDevice!, status: IOReturn) {
+    NSLog("[FlutterThermalPrinterNative] macos.bluetooth sdp.callback status=\(status)")
     guard status == kIOReturnSuccess else {
       complete(.failure(MacOSBluetoothTransportError.sdpQueryFailed(status)))
       return
@@ -191,6 +220,8 @@ private enum MacOSBluetoothTransportError: LocalizedError {
   case invalidAddress
   case deviceUnavailable(String)
   case deviceNotPaired(String)
+  case basebandStartFailed(IOReturn)
+  case basebandConnectionFailed(IOReturn)
   case sdpStartFailed(IOReturn)
   case sdpQueryFailed(IOReturn)
   case serialPortProfileUnavailable
@@ -207,6 +238,10 @@ private enum MacOSBluetoothTransportError: LocalizedError {
       return "Bluetooth printer \(address) is unavailable."
     case .deviceNotPaired(let address):
       return "Bluetooth printer \(address) is not paired."
+    case .basebandStartFailed(let status):
+      return "Unable to start the Bluetooth connection: \(status)."
+    case .basebandConnectionFailed(let status):
+      return "Unable to connect to the Bluetooth printer: \(status)."
     case .sdpStartFailed(let status):
       return "Unable to start Bluetooth service discovery: \(status)."
     case .sdpQueryFailed(let status):
