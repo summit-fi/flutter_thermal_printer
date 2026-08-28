@@ -8,8 +8,7 @@ import 'utils/printer.dart';
 abstract class FlutterThermalPrinterPlatform extends PlatformInterface {
   FlutterThermalPrinterPlatform() : super(token: _token);
   static final Object _token = Object();
-  static FlutterThermalPrinterPlatform _instance =
-      MethodChannelFlutterThermalPrinter();
+  static FlutterThermalPrinterPlatform _instance = MethodChannelFlutterThermalPrinter();
   static FlutterThermalPrinterPlatform get instance => _instance;
 
   static set instance(FlutterThermalPrinterPlatform instance) {
@@ -29,7 +28,7 @@ abstract class FlutterThermalPrinterPlatform extends PlatformInterface {
     throw UnimplementedError('connect() has not been implemented.');
   }
 
-  Future<void> printText(Printer device, Uint8List data, {String? path}) {
+  Future<bool> printText(Printer device, Uint8List data, {String? path}) {
     throw UnimplementedError('printText() has not been implemented.');
   }
 
@@ -38,9 +37,7 @@ abstract class FlutterThermalPrinterPlatform extends PlatformInterface {
   }
 
   Future<dynamic> convertImageToGrayscale(Uint8List? value) {
-    throw UnimplementedError(
-      'convertImageToGrayscale() has not been implemented.',
-    );
+    throw UnimplementedError('convertImageToGrayscale() has not been implemented.');
   }
 
   Future<bool> disconnect(Printer device) {

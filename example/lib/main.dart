@@ -24,10 +24,14 @@ class _MyAppState extends State<MyApp> {
 
   String _ip = '192.168.0.100';
   String _port = '9100';
+  final _bluetoothAddressController = TextEditingController();
+  final _bluetoothNameController = TextEditingController(text: 'Bluetooth printer');
 
   List<Printer> printers = [];
 
   StreamSubscription<List<Printer>>? _devicesStreamSubscription;
+  bool _isBluetoothConnected = false;
+  String? _bluetoothMessage;
 
   // Get Printer List
   void startScan() async {
@@ -36,8 +40,7 @@ class _MyAppState extends State<MyApp> {
       ConnectionType.USB,
       ConnectionType.BLE,
     ]);
-    _devicesStreamSubscription = _flutterThermalPrinterPlugin.devicesStream
-        .listen((List<Printer> event) {
+    _devicesStreamSubscription = _flutterThermalPrinterPlugin.devicesStream.listen((List<Printer> event) {
       setState(() {
         printers = event;
         printers.removeWhere((element) =>
@@ -61,6 +64,75 @@ class _MyAppState extends State<MyApp> {
 
   stopScan() {
     _flutterThermalPrinterPlugin.stopScan();
+  }
+
+  Printer get _bluetoothPrinter => Printer(
+        address: _bluetoothAddressController.text.trim(),
+        name: _bluetoothNameController.text.trim(),
+        connectionType: ConnectionType.BLUETOOTH_CLASSIC,
+      );
+
+  Future<void> _connectBluetoothPrinter() async {
+    final address = _bluetoothAddressController.text.trim();
+    if (address.isEmpty) {
+      setState(() => _bluetoothMessage = 'Enter the Bluetooth address first.');
+      return;
+    }
+    log('[FlutterThermalPrinterExample] bluetooth.connect.started address=$address');
+    final connected = await _flutterThermalPrinterPlugin.connect(_bluetoothPrinter);
+    if (!mounted) return;
+    setState(() {
+      _isBluetoothConnected = connected;
+      _bluetoothMessage = connected ? 'Connected.' : 'Unable to open the Bluetooth serial channel.';
+    });
+    log('[FlutterThermalPrinterExample] bluetooth.connect.completed address=$address connected=$connected');
+  }
+
+  Future<void> _printBluetoothReceipt() async {
+    final address = _bluetoothAddressController.text.trim();
+    if (address.isEmpty) {
+      setState(() => _bluetoothMessage = 'Enter the Bluetooth address first.');
+      return;
+    }
+    log('[FlutterThermalPrinterExample] bluetooth.print.started address=$address');
+    try {
+      final printed = await _flutterThermalPrinterPlugin.printData(
+        _bluetoothPrinter,
+        await _generateReceipt(type: 'Bluetooth Classic'),
+        longData: true,
+      );
+      if (!mounted) return;
+      setState(
+        () => _bluetoothMessage = printed
+            ? 'Print command sent. Check the printer.'
+            : 'The printer did not accept the print command.',
+      );
+      log('[FlutterThermalPrinterExample] bluetooth.print.completed address=$address printed=$printed');
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _bluetoothMessage = 'Print failed: $error');
+      log('[FlutterThermalPrinterExample] bluetooth.print.failed address=$address error=$error');
+    }
+  }
+
+  Future<void> _disconnectBluetoothPrinter() async {
+    final address = _bluetoothAddressController.text.trim();
+    if (address.isEmpty) return;
+    await _flutterThermalPrinterPlugin.disconnect(_bluetoothPrinter);
+    if (!mounted) return;
+    setState(() {
+      _isBluetoothConnected = false;
+      _bluetoothMessage = 'Disconnected.';
+    });
+    log('[FlutterThermalPrinterExample] bluetooth.disconnect.completed address=$address');
+  }
+
+  @override
+  void dispose() {
+    _devicesStreamSubscription?.cancel();
+    _bluetoothAddressController.dispose();
+    _bluetoothNameController.dispose();
+    super.dispose();
   }
 
   @override
@@ -118,8 +190,7 @@ class _MyAppState extends State<MyApp> {
                         final generator = Generator(PaperSize.mm80, profile);
                         List<int> bytes = [];
                         if (context.mounted) {
-                          bytes = await FlutterThermalPrinter.instance
-                              .screenShotWidget(
+                          bytes = await FlutterThermalPrinter.instance.screenShotWidget(
                             context,
                             generator: generator,
                             widget: receiptWidget("Network"),
@@ -136,8 +207,7 @@ class _MyAppState extends State<MyApp> {
                   Expanded(
                     child: ElevatedButton(
                       onPressed: () async {
-                        final service = FlutterThermalPrinterNetwork(_ip,
-                            port: int.parse(_port));
+                        final service = FlutterThermalPrinterNetwork(_ip, port: int.parse(_port));
                         await service.connect();
                         final bytes = await _generateReceipt();
                         await service.printTicket(bytes);
@@ -149,6 +219,46 @@ class _MyAppState extends State<MyApp> {
                 ],
               ),
               const SizedBox(height: 12),
+              const Divider(),
+              const SizedBox(height: 22),
+              Text(
+                'BLUETOOTH CLASSIC',
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _bluetoothAddressController,
+                decoration: const InputDecoration(labelText: 'Bluetooth address'),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _bluetoothNameController,
+                decoration: const InputDecoration(labelText: 'Printer name'),
+              ),
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                children: [
+                  ElevatedButton(
+                    onPressed: _connectBluetoothPrinter,
+                    child: const Text('Connect'),
+                  ),
+                  ElevatedButton(
+                    onPressed: _isBluetoothConnected ? _printBluetoothReceipt : null,
+                    child: const Text('Test receipt'),
+                  ),
+                  ElevatedButton(
+                    onPressed: _isBluetoothConnected ? _disconnectBluetoothPrinter : null,
+                    child: const Text('Disconnect'),
+                  ),
+                ],
+              ),
+              if (_bluetoothMessage != null) ...[
+                const SizedBox(height: 12),
+                Text(_bluetoothMessage!),
+              ],
+              const SizedBox(height: 22),
               const Divider(),
               const SizedBox(height: 22),
               Text(
@@ -187,16 +297,13 @@ class _MyAppState extends State<MyApp> {
                     return ListTile(
                       onTap: () async {
                         if (printers[index].isConnected ?? false) {
-                          await _flutterThermalPrinterPlugin
-                              .disconnect(printers[index]);
+                          await _flutterThermalPrinterPlugin.disconnect(printers[index]);
                         } else {
-                          await _flutterThermalPrinterPlugin
-                              .connect(printers[index]);
+                          await _flutterThermalPrinterPlugin.connect(printers[index]);
                         }
                       },
                       title: Text(printers[index].name ?? 'No Name'),
-                      subtitle: Text(
-                          "Connected: ${printers[index].isConnected ?? false}"),
+                      subtitle: Text("Connected: ${printers[index].isConnected ?? false}"),
                       trailing: IconButton(
                         icon: const Icon(Icons.connect_without_contact),
                         onPressed: () async {
@@ -260,24 +367,15 @@ class _MyAppState extends State<MyApp> {
     bytes += generator.hr();
     bytes += generator.row([
       PosColumn(text: 'Apple', width: 6),
-      PosColumn(
-          text: '\$1.00',
-          width: 6,
-          styles: const PosStyles(align: PosAlign.right)),
+      PosColumn(text: '\$1.00', width: 6, styles: const PosStyles(align: PosAlign.right)),
     ]);
     bytes += generator.row([
       PosColumn(text: 'Banana', width: 6),
-      PosColumn(
-          text: '\$0.50',
-          width: 6,
-          styles: const PosStyles(align: PosAlign.right)),
+      PosColumn(text: '\$0.50', width: 6, styles: const PosStyles(align: PosAlign.right)),
     ]);
     bytes += generator.row([
       PosColumn(text: 'Orange', width: 6),
-      PosColumn(
-          text: '\$0.75',
-          width: 6,
-          styles: const PosStyles(align: PosAlign.right)),
+      PosColumn(text: '\$0.75', width: 6, styles: const PosStyles(align: PosAlign.right)),
     ]);
     bytes += generator.hr();
     bytes += generator.row([
@@ -355,8 +453,7 @@ class _MyAppState extends State<MyApp> {
   }
 }
 
-Widget _buildReceiptRow(String leftText, String rightText,
-    {bool isBold = false}) {
+Widget _buildReceiptRow(String leftText, String rightText, {bool isBold = false}) {
   return Padding(
     padding: const EdgeInsets.symmetric(vertical: 4.0),
     child: Row(
@@ -364,15 +461,11 @@ Widget _buildReceiptRow(String leftText, String rightText,
       children: [
         Text(
           leftText,
-          style: TextStyle(
-              fontSize: 16,
-              fontWeight: isBold ? FontWeight.bold : FontWeight.normal),
+          style: TextStyle(fontSize: 16, fontWeight: isBold ? FontWeight.bold : FontWeight.normal),
         ),
         Text(
           rightText,
-          style: TextStyle(
-              fontSize: 16,
-              fontWeight: isBold ? FontWeight.bold : FontWeight.normal),
+          style: TextStyle(fontSize: 16, fontWeight: isBold ? FontWeight.bold : FontWeight.normal),
         ),
       ],
     ),

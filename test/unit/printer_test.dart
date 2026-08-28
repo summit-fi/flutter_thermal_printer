@@ -332,8 +332,7 @@ void main() {
         );
 
         expect(
-          Printer(connectionType: ConnectionType.NETWORK)
-              .hasValidConnectionData,
+          Printer(connectionType: ConnectionType.NETWORK).hasValidConnectionData,
           false,
         );
       });
@@ -364,20 +363,22 @@ void main() {
   });
 
   group('ConnectionType', () {
-    test('has three values', () {
-      expect(ConnectionType.values.length, 3);
+    test('has four values', () {
+      expect(ConnectionType.values.length, 4);
     });
 
-    test('contains BLE, USB, NETWORK', () {
+    test('contains BLE, USB, network, and Bluetooth Classic', () {
       expect(ConnectionType.values, contains(ConnectionType.BLE));
       expect(ConnectionType.values, contains(ConnectionType.USB));
       expect(ConnectionType.values, contains(ConnectionType.NETWORK));
+      expect(ConnectionType.values, contains(ConnectionType.BLUETOOTH_CLASSIC));
     });
 
     test('name property returns correct strings', () {
       expect(ConnectionType.BLE.name, 'BLE');
       expect(ConnectionType.USB.name, 'USB');
       expect(ConnectionType.NETWORK.name, 'NETWORK');
+      expect(ConnectionType.BLUETOOTH_CLASSIC.name, 'BLUETOOTH_CLASSIC');
     });
 
     test('index values are sequential', () {

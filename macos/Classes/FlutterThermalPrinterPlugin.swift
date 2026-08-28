@@ -8,9 +8,11 @@ import Foundation
 import CoreFoundation
 import AppKit
 import ApplicationServices
+import IOBluetooth
 
 public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStreamHandler{
-    
+    private let bluetoothTransport = MacOSBluetoothClassicPrinterTransport()
+
     private var eventSink: FlutterEventSink?
     public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
         eventSink = events;
@@ -38,11 +40,19 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
             result(getAllPrinters()) // Changed from getAllUsbDevice() to getAllPrinters()
         case "connect":
             let args = call.arguments as? [String: Any]
+            if isBluetoothClassic(args) {
+                connectBluetoothClassic(args: args, result: result)
+                return
+            }
             let printerName = args?["name"] as? String // Using vendorId field to pass printer name for compatibility
             let printerId = args?["productId"] as? String // Using productId field to pass printer ID for compatibility
-            result(connectPrinter(printerName: printerName!, printerId: printerId!))
+            result(connectPrinter(printerName: printerName ?? "", printerId: printerId ?? ""))
         case "printText":
             let args = call.arguments as? [String: Any]
+            if isBluetoothClassic(args) {
+                result(printBluetoothClassic(args: args))
+                return
+            }
             let printerName = args?["name"] as? String ?? ""
             let printerId = args?["productId"] as? String ?? ""
             let data = args?["data"] as? Array<Int> ??  []
@@ -51,11 +61,19 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
             result(success)
         case "isConnected":
             let args = call.arguments as? [String: Any]
+            if isBluetoothClassic(args) {
+                result(isBluetoothClassicConnected(args: args))
+                return
+            }
             let printerName = args?["name"] as? String ?? ""
             let printerId = args?["productId"] as? String ?? ""
             result(connectPrinter(printerName: printerName, printerId: printerId))
         case "disconnect":
             let args = call.arguments as? [String: Any]
+            if isBluetoothClassic(args) {
+                result(disconnectBluetoothClassic(args: args))
+                return
+            }
             let printerName = args?["vendorId"] as? String ?? ""
             let printerId = args?["productId"] as? String ?? ""
             result(disconnectPrinter(printerName: printerName, printerId: printerId))
@@ -66,6 +84,68 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
         default:
             result(FlutterMethodNotImplemented)
         }
+    }
+
+    private func isBluetoothClassic(_ args: [String: Any]?) -> Bool {
+        args?["connectionType"] as? String == "BLUETOOTH_CLASSIC"
+    }
+
+    private func connectBluetoothClassic(args: [String: Any]?, result: @escaping FlutterResult) {
+        guard let address = args?["address"] as? String, !address.isEmpty else {
+            bluetoothLog("connect.failed reason=missing_address")
+            result(false)
+            return
+        }
+        bluetoothLog("connect.started address=\(address)")
+        bluetoothTransport.connect(address: address) { [weak self] connectionResult in
+            switch connectionResult {
+            case .success:
+                self?.bluetoothLog("connect.success address=\(address)")
+                result(true)
+            case .failure(let error):
+                self?.bluetoothLog("connect.failed address=\(address) error=\(error.localizedDescription)")
+                result(false)
+            }
+        }
+    }
+
+    private func printBluetoothClassic(args: [String: Any]?) -> Bool {
+        guard let address = args?["address"] as? String, !address.isEmpty else {
+            bluetoothLog("print.failed reason=missing_address")
+            return false
+        }
+        let bytes = args?["data"] as? [Int] ?? []
+        let data = Data(bytes.map { UInt8(truncatingIfNeeded: $0) })
+        guard !data.isEmpty else {
+            bluetoothLog("print.skipped address=\(address) reason=empty_data")
+            return true
+        }
+        switch bluetoothTransport.write(data: data, address: address) {
+        case .success:
+            bluetoothLog("print.success address=\(address) bytes=\(data.count)")
+            return true
+        case .failure(let error):
+            bluetoothLog("print.failed address=\(address) bytes=\(data.count) error=\(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private func isBluetoothClassicConnected(args: [String: Any]?) -> Bool {
+        guard let address = args?["address"] as? String, !address.isEmpty else { return false }
+        let isConnected = bluetoothTransport.isConnected(address: address)
+        bluetoothLog("connection.checked address=\(address) connected=\(isConnected)")
+        return isConnected
+    }
+
+    private func disconnectBluetoothClassic(args: [String: Any]?) -> Bool {
+        guard let address = args?["address"] as? String, !address.isEmpty else { return false }
+        bluetoothTransport.disconnect(address: address)
+        bluetoothLog("disconnect.requested address=\(address)")
+        return true
+    }
+
+    private func bluetoothLog(_ message: String) {
+        NSLog("[FlutterThermalPrinterNative] macos.bluetooth \(message)")
     }
     
     // MARK: - New Printer-based Implementation
