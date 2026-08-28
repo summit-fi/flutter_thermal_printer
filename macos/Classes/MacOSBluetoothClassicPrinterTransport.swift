@@ -1,7 +1,7 @@
 import Foundation
 import IOBluetooth
 
-final class MacOSBluetoothClassicPrinterTransport: NSObject {
+final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMChannelDelegate {
   private var channelsByAddress = [String: IOBluetoothRFCOMMChannel]()
   private var pendingConnections = [String: MacOSBluetoothSdpQuery]()
 
@@ -96,7 +96,7 @@ final class MacOSBluetoothClassicPrinterTransport: NSObject {
     completion: @escaping (Result<Void, Error>) -> Void
   ) {
     var channel: IOBluetoothRFCOMMChannel?
-    let status = device.openRFCOMMChannelSync(&channel, withChannelID: channelId, delegate: nil)
+    let status = device.openRFCOMMChannelSync(&channel, withChannelID: channelId, delegate: self)
     guard status == kIOReturnSuccess, let channel else {
       completion(.failure(MacOSBluetoothTransportError.channelOpenFailed(status)))
       return
@@ -104,6 +104,20 @@ final class MacOSBluetoothClassicPrinterTransport: NSObject {
     channelsByAddress[address] = channel
     log("connect.completed address=\(address) channel=\(channelId) mtu=\(channel.getMTU())")
     completion(.success(()))
+  }
+
+  func rfcommChannelData(
+    _ rfcommChannel: IOBluetoothRFCOMMChannel!,
+    data dataPointer: UnsafeMutableRawPointer!,
+    length dataLength: Int
+  ) {
+    log("channel.data_received channel=\(rfcommChannel.getID()) bytes=\(dataLength)")
+  }
+
+  func rfcommChannelClosed(_ rfcommChannel: IOBluetoothRFCOMMChannel!) {
+    guard let entry = channelsByAddress.first(where: { $0.value === rfcommChannel }) else { return }
+    channelsByAddress.removeValue(forKey: entry.key)
+    log("channel.closed address=\(entry.key) channel=\(rfcommChannel.getID())")
   }
 
   private func normalize(_ address: String) -> String {
