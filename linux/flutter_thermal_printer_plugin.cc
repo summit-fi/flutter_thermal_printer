@@ -223,6 +223,10 @@ static void usb_log(const std::string& message) {
 }
 
 struct LibusbPrinterAddress {
+  bool uses_serial = false;
+  uint16_t vendor_id = 0;
+  uint16_t product_id = 0;
+  std::string serial_number;
   uint8_t bus_number = 0;
   uint8_t device_address = 0;
   int interface_number = -1;
@@ -232,11 +236,33 @@ struct LibusbPrinterAddress {
 static bool parse_libusb_printer_address(
     const std::string& address, LibusbPrinterAddress* result) {
   if (result == nullptr || address.rfind("libusb:", 0) != 0) return false;
+  if (address.rfind("libusb:serial:", 0) == 0) {
+    const std::string prefix = "libusb:serial:";
+    const size_t vendor_end = address.find(':', prefix.size());
+    const size_t product_end = vendor_end == std::string::npos
+        ? std::string::npos : address.find(':', vendor_end + 1);
+    if (vendor_end == std::string::npos || product_end == std::string::npos || product_end + 1 >= address.size()) {
+      return false;
+    }
+    unsigned int vendor = 0;
+    unsigned int product = 0;
+    if (sscanf(address.substr(prefix.size(), vendor_end - prefix.size()).c_str(), "%x", &vendor) != 1 ||
+        sscanf(address.substr(vendor_end + 1, product_end - vendor_end - 1).c_str(), "%x", &product) != 1 ||
+        vendor > UINT16_MAX || product > UINT16_MAX) {
+      return false;
+    }
+    result->uses_serial = true;
+    result->vendor_id = static_cast<uint16_t>(vendor);
+    result->product_id = static_cast<uint16_t>(product);
+    result->serial_number = address.substr(product_end + 1);
+    return !result->serial_number.empty();
+  }
+  if (address.rfind("libusb:port:", 0) != 0) return false;
   unsigned int bus = 0;
   unsigned int device = 0;
   unsigned int interface_number = 0;
   unsigned int endpoint = 0;
-  if (sscanf(address.c_str(), "libusb:%u:%u:%u:%u", &bus, &device, &interface_number, &endpoint) != 4 ||
+  if (sscanf(address.c_str(), "libusb:port:%u:%u:%u:%u", &bus, &device, &interface_number, &endpoint) != 4 ||
       bus > UINT8_MAX || device > UINT8_MAX || interface_number > INT_MAX || endpoint > UINT8_MAX) {
     return false;
   }
@@ -247,16 +273,62 @@ static bool parse_libusb_printer_address(
   return true;
 }
 
+static std::string libusb_device_serial(libusb_device* device, const libusb_device_descriptor& descriptor) {
+  if (descriptor.iSerialNumber == 0) return {};
+  libusb_device_handle* handle = nullptr;
+  if (libusb_open(device, &handle) != 0 || handle == nullptr) return {};
+  unsigned char buffer[256]{};
+  const int length = libusb_get_string_descriptor_ascii(
+      handle, descriptor.iSerialNumber, buffer, sizeof(buffer));
+  libusb_close(handle);
+  return length > 0 ? std::string(reinterpret_cast<char*>(buffer), length) : std::string();
+}
+
 static libusb_device* find_libusb_device(
     libusb_device** devices, ssize_t count, const LibusbPrinterAddress& address) {
   for (ssize_t index = 0; index < count; ++index) {
     auto* device = devices[index];
+    if (address.uses_serial) {
+      libusb_device_descriptor descriptor{};
+      if (libusb_get_device_descriptor(device, &descriptor) != 0 ||
+          descriptor.idVendor != address.vendor_id || descriptor.idProduct != address.product_id ||
+          libusb_device_serial(device, descriptor) != address.serial_number) {
+        continue;
+      }
+      return device;
+    }
     if (libusb_get_bus_number(device) == address.bus_number &&
         libusb_get_device_address(device) == address.device_address) {
       return device;
     }
   }
   return nullptr;
+}
+
+static bool find_printer_endpoint(
+    libusb_device* device, int* interface_number, uint8_t* endpoint_address) {
+  libusb_config_descriptor* config = nullptr;
+  if (libusb_get_active_config_descriptor(device, &config) != 0 || config == nullptr) return false;
+  bool found = false;
+  for (uint8_t interface_index = 0; interface_index < config->bNumInterfaces && !found; ++interface_index) {
+    const auto& interface = config->interface[interface_index];
+    for (int alternate_index = 0; alternate_index < interface.num_altsetting && !found; ++alternate_index) {
+      const auto& alternate = interface.altsetting[alternate_index];
+      if (alternate.bInterfaceClass != LIBUSB_CLASS_PRINTER) continue;
+      for (uint8_t endpoint_index = 0; endpoint_index < alternate.bNumEndpoints; ++endpoint_index) {
+        const auto& endpoint = alternate.endpoint[endpoint_index];
+        if ((endpoint.bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) == LIBUSB_TRANSFER_TYPE_BULK &&
+            (endpoint.bEndpointAddress & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_OUT) {
+          *interface_number = alternate.bInterfaceNumber;
+          *endpoint_address = endpoint.bEndpointAddress;
+          found = true;
+          break;
+        }
+      }
+    }
+  }
+  libusb_free_config_descriptor(config);
+  return found;
 }
 
 static bool libusb_transfer_data(
@@ -272,6 +344,10 @@ static bool libusb_transfer_data(
   libusb_device** devices = nullptr;
   const ssize_t count = libusb_get_device_list(context, &devices);
   auto* device = find_libusb_device(devices, count, parsed);
+  if (device != nullptr && parsed.uses_serial &&
+      !find_printer_endpoint(device, &parsed.interface_number, &parsed.endpoint_address)) {
+    device = nullptr;
+  }
   libusb_device_handle* handle = nullptr;
   bool success = false;
   if (device != nullptr && libusb_open(device, &handle) == 0 && handle != nullptr) {
