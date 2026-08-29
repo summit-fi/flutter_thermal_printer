@@ -5,6 +5,7 @@
 
 #include <cups/cups.h>
 #include <bluetooth/bluetooth.h>
+#include <libusb-1.0/libusb.h>
 #include <bluetooth/rfcomm.h>
 #include <bluetooth/sdp.h>
 #include <bluetooth/sdp_lib.h>
@@ -15,7 +16,9 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <climits>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -219,6 +222,97 @@ static void usb_log(const std::string& message) {
   g_message("[FlutterThermalPrinterNative] linux.usb %s", message.c_str());
 }
 
+struct LibusbPrinterAddress {
+  uint8_t bus_number = 0;
+  uint8_t device_address = 0;
+  int interface_number = -1;
+  uint8_t endpoint_address = 0;
+};
+
+static bool parse_libusb_printer_address(
+    const std::string& address, LibusbPrinterAddress* result) {
+  if (result == nullptr || address.rfind("libusb:", 0) != 0) return false;
+  unsigned int bus = 0;
+  unsigned int device = 0;
+  unsigned int interface_number = 0;
+  unsigned int endpoint = 0;
+  if (sscanf(address.c_str(), "libusb:%u:%u:%u:%u", &bus, &device, &interface_number, &endpoint) != 4 ||
+      bus > UINT8_MAX || device > UINT8_MAX || interface_number > INT_MAX || endpoint > UINT8_MAX) {
+    return false;
+  }
+  result->bus_number = static_cast<uint8_t>(bus);
+  result->device_address = static_cast<uint8_t>(device);
+  result->interface_number = static_cast<int>(interface_number);
+  result->endpoint_address = static_cast<uint8_t>(endpoint);
+  return true;
+}
+
+static libusb_device* find_libusb_device(
+    libusb_device** devices, ssize_t count, const LibusbPrinterAddress& address) {
+  for (ssize_t index = 0; index < count; ++index) {
+    auto* device = devices[index];
+    if (libusb_get_bus_number(device) == address.bus_number &&
+        libusb_get_device_address(device) == address.device_address) {
+      return device;
+    }
+  }
+  return nullptr;
+}
+
+static bool libusb_transfer_data(
+    const std::string& address, const std::vector<uint8_t>* bytes) {
+  LibusbPrinterAddress parsed;
+  if (!parse_libusb_printer_address(address, &parsed)) {
+    usb_log("connection.failed reason=invalid_libusb_address address=" + address);
+    return false;
+  }
+
+  libusb_context* context = nullptr;
+  if (libusb_init(&context) != 0) return false;
+  libusb_device** devices = nullptr;
+  const ssize_t count = libusb_get_device_list(context, &devices);
+  auto* device = find_libusb_device(devices, count, parsed);
+  libusb_device_handle* handle = nullptr;
+  bool success = false;
+  if (device != nullptr && libusb_open(device, &handle) == 0 && handle != nullptr) {
+    libusb_set_auto_detach_kernel_driver(handle, 1);
+    const int claim_result = libusb_claim_interface(handle, parsed.interface_number);
+    if (claim_result == 0) {
+      success = true;
+      if (bytes != nullptr) {
+        size_t offset = 0;
+        while (offset < bytes->size()) {
+          const int transfer_size = static_cast<int>(std::min<size_t>(16 * 1024, bytes->size() - offset));
+          int transferred = 0;
+          const int transfer_result = libusb_bulk_transfer(
+              handle,
+              parsed.endpoint_address,
+              const_cast<unsigned char*>(bytes->data() + offset),
+              transfer_size,
+              &transferred,
+              10'000);
+          if (transfer_result != 0 || transferred <= 0) {
+            usb_log("print.failed stage=bulk_transfer error=" +
+                    std::string(libusb_error_name(transfer_result)));
+            success = false;
+            break;
+          }
+          offset += static_cast<size_t>(transferred);
+        }
+      }
+      libusb_release_interface(handle, parsed.interface_number);
+    } else {
+      usb_log("connection.failed stage=claim_interface error=" +
+              std::string(libusb_error_name(claim_result)));
+    }
+    libusb_close(handle);
+  }
+  if (!success && device == nullptr) usb_log("connection.failed reason=device_not_found address=" + address);
+  if (count >= 0) libusb_free_device_list(devices, 1);
+  libusb_exit(context);
+  return success;
+}
+
 static bool is_usb_printer_device_path(const std::string& path) {
   constexpr char kUsbPrinterPrefix[] = "/dev/usb/lp";
   if (path.rfind(kUsbPrinterPrefix, 0) != 0 || path.size() == strlen(kUsbPrinterPrefix)) {
@@ -230,6 +324,11 @@ static bool is_usb_printer_device_path(const std::string& path) {
 }
 
 static bool can_access_usb_printer(const std::string& path) {
+  if (path.rfind("libusb:", 0) == 0) {
+    const bool connected = libusb_transfer_data(path, nullptr);
+    usb_log("connection.checked path=" + path + " connected=" + std::to_string(connected));
+    return connected;
+  }
   if (!is_usb_printer_device_path(path)) {
     usb_log("connection.failed reason=invalid_path path=" + path);
     return false;
@@ -245,6 +344,11 @@ static bool can_access_usb_printer(const std::string& path) {
 }
 
 static bool print_usb_printer(const std::string& path, const std::vector<uint8_t>& bytes) {
+  if (path.rfind("libusb:", 0) == 0) {
+    const bool printed = libusb_transfer_data(path, &bytes);
+    if (printed) usb_log("print.success path=" + path + " bytes=" + std::to_string(bytes.size()));
+    return printed;
+  }
   if (!can_access_usb_printer(path)) return false;
   if (bytes.empty()) return true;
 

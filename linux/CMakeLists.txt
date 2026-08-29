@@ -10,6 +10,7 @@ set(PLUGIN_NAME "flutter_thermal_printer_plugin")
 # Find system dependencies.
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GTK REQUIRED IMPORTED_TARGET gtk+-3.0)
+pkg_check_modules(LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0)
 
 # Find CUPS via find_library/find_path to avoid transitive pkg-config issues
 # (gnutls, avahi-client may not have .pc files on all systems).
@@ -42,4 +43,5 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
   flutter
   PkgConfig::GTK
   ${CUPS_LIBRARY}
-  ${BLUETOOTH_LIBRARY})
+  ${BLUETOOTH_LIBRARY}
+  PkgConfig::LIBUSB)
