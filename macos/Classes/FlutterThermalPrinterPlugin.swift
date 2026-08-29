@@ -12,6 +12,7 @@ import IOBluetooth
 
 public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStreamHandler{
     private let bluetoothTransport = MacOSBluetoothClassicPrinterTransport()
+    private let usbTransport = MacOSUsbPrinterTransport()
 
     private var eventSink: FlutterEventSink?
     public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
@@ -44,6 +45,10 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
                 connectBluetoothClassic(args: args, result: result)
                 return
             }
+            if isDirectUsb(args) {
+                connectDirectUsb(args: args, result: result)
+                return
+            }
             let printerName = args?["name"] as? String // Using vendorId field to pass printer name for compatibility
             let printerId = args?["productId"] as? String // Using productId field to pass printer ID for compatibility
             result(connectPrinter(printerName: printerName ?? "", printerId: printerId ?? ""))
@@ -51,6 +56,10 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
             let args = call.arguments as? [String: Any]
             if isBluetoothClassic(args) {
                 printBluetoothClassic(args: args, result: result)
+                return
+            }
+            if isDirectUsb(args) {
+                printDirectUsb(args: args, result: result)
                 return
             }
             let printerName = args?["name"] as? String ?? ""
@@ -63,6 +72,10 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
             let args = call.arguments as? [String: Any]
             if isBluetoothClassic(args) {
                 result(isBluetoothClassicConnected(args: args))
+                return
+            }
+            if isDirectUsb(args) {
+                checkDirectUsbConnection(args: args, result: result)
                 return
             }
             let printerName = args?["name"] as? String ?? ""
@@ -88,6 +101,48 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
 
     private func isBluetoothClassic(_ args: [String: Any]?) -> Bool {
         args?["connectionType"] as? String == "BLUETOOTH_CLASSIC"
+    }
+
+    private func isDirectUsb(_ args: [String: Any]?) -> Bool {
+        guard args?["connectionType"] as? String == "USB",
+              let address = args?["address"] as? String
+        else { return false }
+        return address.lowercased().hasPrefix("usb:")
+    }
+
+    private func connectDirectUsb(args: [String: Any]?, result: @escaping FlutterResult) {
+        guard let address = args?["address"] as? String else {
+            result(false)
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [usbTransport] in
+            let connected = usbTransport.canOpen(address: address)
+            DispatchQueue.main.async { result(connected) }
+        }
+    }
+
+    private func printDirectUsb(args: [String: Any]?, result: @escaping FlutterResult) {
+        guard let address = args?["address"] as? String else {
+            result(false)
+            return
+        }
+        let bytes = args?["data"] as? [Int] ?? []
+        let data = Data(bytes.map { UInt8(truncatingIfNeeded: $0) })
+        DispatchQueue.global(qos: .userInitiated).async { [usbTransport] in
+            let printed = usbTransport.write(data: data, address: address)
+            DispatchQueue.main.async { result(printed) }
+        }
+    }
+
+    private func checkDirectUsbConnection(args: [String: Any]?, result: @escaping FlutterResult) {
+        guard let address = args?["address"] as? String else {
+            result(false)
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [usbTransport] in
+            let connected = usbTransport.canOpen(address: address)
+            DispatchQueue.main.async { result(connected) }
+        }
     }
 
     private func connectBluetoothClassic(args: [String: Any]?, result: @escaping FlutterResult) {
