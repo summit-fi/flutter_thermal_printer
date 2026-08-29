@@ -220,7 +220,28 @@ static bool bluetooth_address_from_string(const std::string& address, bdaddr_t* 
   return str2ba(address.c_str(), result) == 0;
 }
 
+// sdp_get_access_protos returns an outer list whose items are protocol
+// descriptor lists. The descriptor data is owned by the SDP record, so only
+// the list nodes themselves must be released.
+static void free_protocol_lists(sdp_list_t* protocol_lists) {
+  for (sdp_list_t* node = protocol_lists; node != nullptr; node = node->next) {
+    sdp_list_free(static_cast<sdp_list_t*>(node->data), nullptr);
+  }
+  sdp_list_free(protocol_lists, nullptr);
+}
+
+static void free_service_records(sdp_list_t* records) {
+  for (sdp_list_t* node = records; node != nullptr; node = node->next) {
+    sdp_record_free(static_cast<sdp_record_t*>(node->data));
+  }
+  sdp_list_free(records, nullptr);
+}
+
 static int serial_port_channel(const bdaddr_t& target) {
+  char target_address[18]{};
+  ba2str(&target, target_address);
+  bluetooth_log("sdp.started address=" + std::string(target_address));
+
   uuid_t service_uuid{};
   sdp_uuid16_create(&service_uuid, SERIAL_PORT_SVCLASS_ID);
   sdp_list_t* search_list = sdp_list_append(nullptr, &service_uuid);
@@ -235,6 +256,7 @@ static int serial_port_channel(const bdaddr_t& target) {
     sdp_list_free(attribute_list, nullptr);
     return -1;
   }
+  bluetooth_log("sdp.connected address=" + std::string(target_address));
 
   const int status = sdp_service_search_attr_req(
       session, search_list, SDP_ATTR_REQ_RANGE, attribute_list, &response_list);
@@ -246,14 +268,17 @@ static int serial_port_channel(const bdaddr_t& target) {
       sdp_list_t* protocol_list = nullptr;
       if (sdp_get_access_protos(record, &protocol_list) == 0) {
         channel = sdp_get_proto_port(protocol_list, RFCOMM_UUID);
-        sdp_list_free(protocol_list, reinterpret_cast<sdp_free_func_t>(sdp_list_free));
+        free_protocol_lists(protocol_list);
       }
     }
+    bluetooth_log(
+        "sdp.completed address=" + std::string(target_address) +
+        " channel=" + std::to_string(channel));
   } else {
     bluetooth_log("sdp.failed stage=search status=" + std::to_string(status));
   }
 
-  sdp_list_free(response_list, reinterpret_cast<sdp_free_func_t>(sdp_record_free));
+  free_service_records(response_list);
   sdp_list_free(search_list, nullptr);
   sdp_list_free(attribute_list, nullptr);
   sdp_close(session);
@@ -400,6 +425,10 @@ static gboolean complete_bluetooth_operation(gpointer user_data) {
 
 static gpointer run_bluetooth_operation(gpointer user_data) {
   auto* operation = static_cast<BluetoothOperation*>(user_data);
+  bluetooth_log(
+      "operation.started kind=" +
+      std::string(operation->kind == BluetoothOperationKind::print ? "print" : "connect") +
+      " address=" + operation->address);
   operation->success = operation->kind == BluetoothOperationKind::print
       ? print_bluetooth_classic(operation->address, operation->bytes)
       : can_connect_bluetooth_classic(operation->address);
