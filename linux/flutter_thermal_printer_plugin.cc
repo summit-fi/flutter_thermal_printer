@@ -4,10 +4,18 @@
 #include "include/flutter_thermal_printer/flutter_thermal_printer_plugin.h"
 
 #include <cups/cups.h>
+#include <bluetooth/bluetooth.h>
+#include <bluetooth/rfcomm.h>
+#include <bluetooth/sdp.h>
+#include <bluetooth/sdp_lib.h>
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/select.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -181,6 +189,229 @@ static std::string map_get_string(FlValue* map, const char* key) {
   return str ? str : "";
 }
 
+static std::vector<uint8_t> bytes_from_value(FlValue* value) {
+  std::vector<uint8_t> bytes;
+  if (value == nullptr) return bytes;
+  if (fl_value_get_type(value) == FL_VALUE_TYPE_UINT8_LIST) {
+    const size_t length = fl_value_get_length(value);
+    const auto* data = fl_value_get_uint8_list(value);
+    bytes.assign(data, data + length);
+    return bytes;
+  }
+  if (fl_value_get_type(value) == FL_VALUE_TYPE_LIST) {
+    const size_t length = fl_value_get_length(value);
+    bytes.reserve(length);
+    for (size_t index = 0; index < length; ++index) {
+      FlValue* item = fl_value_get_list_value(value, index);
+      if (fl_value_get_type(item) == FL_VALUE_TYPE_INT) {
+        bytes.push_back(static_cast<uint8_t>(fl_value_get_int(item)));
+      }
+    }
+  }
+  return bytes;
+}
+
+static void bluetooth_log(const std::string& message) {
+  g_message("[FlutterThermalPrinterNative] linux.bluetooth %s", message.c_str());
+}
+
+static bool bluetooth_address_from_string(const std::string& address, bdaddr_t* result) {
+  if (result == nullptr || address.empty()) return false;
+  return str2ba(address.c_str(), result) == 0;
+}
+
+static int serial_port_channel(const bdaddr_t& target) {
+  uuid_t service_uuid{};
+  sdp_uuid16_create(&service_uuid, SERIAL_PORT_SVCLASS_ID);
+  sdp_list_t* search_list = sdp_list_append(nullptr, &service_uuid);
+  uint32_t range = 0x0000ffff;
+  sdp_list_t* attribute_list = sdp_list_append(nullptr, &range);
+  sdp_list_t* response_list = nullptr;
+  const bdaddr_t any = {{0, 0, 0, 0, 0, 0}};
+  sdp_session_t* session = sdp_connect(&any, &target, SDP_RETRY_IF_BUSY);
+  if (session == nullptr) {
+    bluetooth_log("sdp.failed stage=connect errno=" + std::to_string(errno));
+    sdp_list_free(search_list, nullptr);
+    sdp_list_free(attribute_list, nullptr);
+    return -1;
+  }
+
+  const int status = sdp_service_search_attr_req(
+      session, search_list, SDP_ATTR_REQ_RANGE, attribute_list, &response_list);
+  int channel = -1;
+  if (status == 0) {
+    for (sdp_list_t* record_node = response_list; record_node != nullptr && channel < 0;
+         record_node = record_node->next) {
+      auto* record = static_cast<sdp_record_t*>(record_node->data);
+      sdp_list_t* protocol_list = nullptr;
+      if (sdp_get_access_protos(record, &protocol_list) == 0) {
+        channel = sdp_get_proto_port(protocol_list, RFCOMM_UUID);
+        sdp_list_free(protocol_list, reinterpret_cast<sdp_free_func_t>(sdp_list_free));
+      }
+    }
+  } else {
+    bluetooth_log("sdp.failed stage=search status=" + std::to_string(status));
+  }
+
+  sdp_list_free(response_list, reinterpret_cast<sdp_free_func_t>(sdp_record_free));
+  sdp_list_free(search_list, nullptr);
+  sdp_list_free(attribute_list, nullptr);
+  sdp_close(session);
+  return channel;
+}
+
+static bool connect_rfcomm_socket(int socket_fd, const sockaddr_rc& remote) {
+  const int previous_flags = fcntl(socket_fd, F_GETFL, 0);
+  if (previous_flags < 0 || fcntl(socket_fd, F_SETFL, previous_flags | O_NONBLOCK) < 0) {
+    bluetooth_log("connect.failed stage=nonblocking errno=" + std::to_string(errno));
+    return false;
+  }
+  const int result = connect(socket_fd, reinterpret_cast<const sockaddr*>(&remote), sizeof(remote));
+  if (result == 0) {
+    fcntl(socket_fd, F_SETFL, previous_flags);
+    return true;
+  }
+  if (errno != EINPROGRESS) {
+    bluetooth_log("connect.failed stage=connect errno=" + std::to_string(errno));
+    fcntl(socket_fd, F_SETFL, previous_flags);
+    return false;
+  }
+
+  fd_set write_set;
+  FD_ZERO(&write_set);
+  FD_SET(socket_fd, &write_set);
+  timeval timeout{};
+  timeout.tv_sec = 10;
+  const int selected = select(socket_fd + 1, nullptr, &write_set, nullptr, &timeout);
+  int socket_error = 0;
+  socklen_t socket_error_size = sizeof(socket_error);
+  const bool connected = selected == 1 &&
+      getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_size) == 0 &&
+      socket_error == 0;
+  if (!connected) {
+    bluetooth_log(
+        "connect.failed stage=wait selected=" + std::to_string(selected) +
+        " error=" + std::to_string(socket_error));
+  }
+  fcntl(socket_fd, F_SETFL, previous_flags);
+  return connected;
+}
+
+static bool print_bluetooth_classic(const std::string& address, const std::vector<uint8_t>& bytes) {
+  if (bytes.empty()) return true;
+  bdaddr_t target{};
+  if (!bluetooth_address_from_string(address, &target)) {
+    bluetooth_log("print.failed reason=invalid_address address=" + address);
+    return false;
+  }
+  const int channel = serial_port_channel(target);
+  if (channel <= 0) {
+    bluetooth_log("print.failed reason=serial_port_profile_unavailable address=" + address);
+    return false;
+  }
+
+  const int socket_fd = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
+  if (socket_fd < 0) {
+    bluetooth_log("print.failed stage=socket errno=" + std::to_string(errno));
+    return false;
+  }
+  timeval timeout{};
+  timeout.tv_sec = 10;
+  setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+  sockaddr_rc remote{};
+  remote.rc_family = AF_BLUETOOTH;
+  remote.rc_bdaddr = target;
+  remote.rc_channel = static_cast<uint8_t>(channel);
+  bluetooth_log(
+      "connect.started address=" + address + " channel=" + std::to_string(channel));
+  if (!connect_rfcomm_socket(socket_fd, remote)) {
+    close(socket_fd);
+    return false;
+  }
+
+  constexpr size_t kChunkSize = 1'024;
+  size_t offset = 0;
+  while (offset < bytes.size()) {
+    const size_t size = std::min(kChunkSize, bytes.size() - offset);
+    const ssize_t written = write(socket_fd, bytes.data() + offset, size);
+    if (written <= 0) {
+      bluetooth_log(
+          "print.failed stage=write offset=" + std::to_string(offset) + " errno=" + std::to_string(errno));
+      close(socket_fd);
+      return false;
+    }
+    offset += static_cast<size_t>(written);
+  }
+  close(socket_fd);
+  bluetooth_log("print.success address=" + address + " bytes=" + std::to_string(bytes.size()));
+  return true;
+}
+
+static bool can_connect_bluetooth_classic(const std::string& address) {
+  bdaddr_t target{};
+  if (!bluetooth_address_from_string(address, &target)) return false;
+  const int channel = serial_port_channel(target);
+  if (channel <= 0) return false;
+
+  const int socket_fd = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
+  if (socket_fd < 0) return false;
+  timeval timeout{};
+  timeout.tv_sec = 10;
+  setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  sockaddr_rc remote{};
+  remote.rc_family = AF_BLUETOOTH;
+  remote.rc_bdaddr = target;
+  remote.rc_channel = static_cast<uint8_t>(channel);
+  const bool connected = connect_rfcomm_socket(socket_fd, remote);
+  close(socket_fd);
+  bluetooth_log(
+      "connection.checked address=" + address + " channel=" + std::to_string(channel) +
+      " connected=" + std::to_string(connected));
+  return connected;
+}
+
+enum class BluetoothOperationKind { connect, print };
+
+struct BluetoothOperation {
+  FlMethodCall* method_call;
+  BluetoothOperationKind kind;
+  std::string address;
+  std::vector<uint8_t> bytes;
+  bool success = false;
+};
+
+static gboolean complete_bluetooth_operation(gpointer user_data) {
+  auto* operation = static_cast<BluetoothOperation*>(user_data);
+  g_autoptr(FlMethodResponse) response = nullptr;
+  if (operation->kind == BluetoothOperationKind::print && !operation->success) {
+    response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+        "PRINT_ERROR", "Unable to write data to the Bluetooth printer", nullptr));
+  } else {
+    g_autoptr(FlValue) result = fl_value_new_bool(operation->success ? TRUE : FALSE);
+    response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
+  }
+  fl_method_call_respond(operation->method_call, response, nullptr);
+  g_object_unref(operation->method_call);
+  delete operation;
+  return G_SOURCE_REMOVE;
+}
+
+static gpointer run_bluetooth_operation(gpointer user_data) {
+  auto* operation = static_cast<BluetoothOperation*>(user_data);
+  operation->success = operation->kind == BluetoothOperationKind::print
+      ? print_bluetooth_classic(operation->address, operation->bytes)
+      : can_connect_bluetooth_classic(operation->address);
+  g_main_context_invoke(nullptr, complete_bluetooth_operation, operation);
+  return nullptr;
+}
+
+static void start_bluetooth_operation(BluetoothOperation* operation) {
+  GThread* thread = g_thread_new("thermal-bluetooth", run_bluetooth_operation, operation);
+  g_thread_unref(thread);
+}
+
 // ---------------------------------------------------------------------------
 // Method call handler
 // ---------------------------------------------------------------------------
@@ -205,8 +436,21 @@ static void method_call_cb(FlMethodChannel* channel,
     response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
 
   // ── connect ───────────────────────────────────────────────────────────────
-  // For CUPS, "connecting" just means checking that the queue exists.
+  // For a direct Bluetooth Classic printer, this verifies that the paired
+  // device exposes SPP/RFCOMM and accepts a socket connection. CUPS queues
+  // remain the fallback for all other desktop printers.
   } else if (strcmp(method, "connect") == 0) {
+    const std::string connection_type = map_get_string(args, "connectionType");
+    if (connection_type == "BLUETOOTH_CLASSIC") {
+      const auto address = map_get_string(args, "address");
+      auto* operation = new BluetoothOperation{
+          FL_METHOD_CALL(g_object_ref(method_call)),
+          BluetoothOperationKind::connect,
+          address,
+      };
+      start_bluetooth_operation(operation);
+      return;
+    }
     const std::string name = map_get_string(args, "name");
     const bool found = cups_printer_exists(name.c_str());
     g_autoptr(FlValue) result = fl_value_new_bool(found ? TRUE : FALSE);
@@ -221,6 +465,17 @@ static void method_call_cb(FlMethodChannel* channel,
   // ── isConnected ───────────────────────────────────────────────────────────
   // Returns true if the CUPS queue still exists and is accepting jobs.
   } else if (strcmp(method, "isConnected") == 0) {
+    const std::string connection_type = map_get_string(args, "connectionType");
+    if (connection_type == "BLUETOOTH_CLASSIC") {
+      const auto address = map_get_string(args, "address");
+      auto* operation = new BluetoothOperation{
+          FL_METHOD_CALL(g_object_ref(method_call)),
+          BluetoothOperationKind::connect,
+          address,
+      };
+      start_bluetooth_operation(operation);
+      return;
+    }
     // The Dart layer sends vendorId = CUPS queue name (set in getUsbDevicesList).
     std::string printer_name = map_get_string(args, "vendorId");
     if (printer_name.empty()) {
@@ -239,7 +494,25 @@ static void method_call_cb(FlMethodChannel* channel,
     } else {
       // Resolve printer name: prefer 'name', fall back to 'vendorId'.
       std::string printer_name = map_get_string(args, "name");
-      if (printer_name.empty()) {
+      const std::string connection_type = map_get_string(args, "connectionType");
+      if (connection_type == "BLUETOOTH_CLASSIC") {
+        const auto address = map_get_string(args, "address");
+        FlValue* data_val = fl_value_lookup_string(args, "data");
+        const auto data_bytes = bytes_from_value(data_val);
+        if (address.empty() || data_bytes.empty()) {
+          response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+              "INVALID_ARGS", "Bluetooth printer address or data is missing", nullptr));
+        } else {
+          auto* operation = new BluetoothOperation{
+              FL_METHOD_CALL(g_object_ref(method_call)),
+              BluetoothOperationKind::print,
+              address,
+              data_bytes,
+          };
+          start_bluetooth_operation(operation);
+          return;
+        }
+      } else if (printer_name.empty()) {
         printer_name = map_get_string(args, "vendorId");
       }
       if (printer_name.empty()) {

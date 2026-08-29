@@ -15,6 +15,7 @@ pkg_check_modules(GTK REQUIRED IMPORTED_TARGET gtk+-3.0)
 # (gnutls, avahi-client may not have .pc files on all systems).
 find_library(CUPS_LIBRARY NAMES cups REQUIRED)
 find_path(CUPS_INCLUDE_DIR NAMES cups/cups.h REQUIRED)
+find_library(BLUETOOTH_LIBRARY NAMES bluetooth REQUIRED)
 
 list(APPEND PLUGIN_SOURCES
   "flutter_thermal_printer_plugin.cc"
@@ -40,4 +41,5 @@ target_include_directories(${PLUGIN_NAME} PRIVATE
 target_link_libraries(${PLUGIN_NAME} PRIVATE
   flutter
   PkgConfig::GTK
-  ${CUPS_LIBRARY})
+  ${CUPS_LIBRARY}
+  ${BLUETOOTH_LIBRARY})
