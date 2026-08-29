@@ -215,6 +215,62 @@ static void bluetooth_log(const std::string& message) {
   g_message("[FlutterThermalPrinterNative] linux.bluetooth %s", message.c_str());
 }
 
+static void usb_log(const std::string& message) {
+  g_message("[FlutterThermalPrinterNative] linux.usb %s", message.c_str());
+}
+
+static bool is_usb_printer_device_path(const std::string& path) {
+  constexpr char kUsbPrinterPrefix[] = "/dev/usb/lp";
+  if (path.rfind(kUsbPrinterPrefix, 0) != 0 || path.size() == strlen(kUsbPrinterPrefix)) {
+    return false;
+  }
+  return std::all_of(
+      path.begin() + strlen(kUsbPrinterPrefix), path.end(),
+      [](unsigned char character) { return std::isdigit(character) != 0; });
+}
+
+static bool can_access_usb_printer(const std::string& path) {
+  if (!is_usb_printer_device_path(path)) {
+    usb_log("connection.failed reason=invalid_path path=" + path);
+    return false;
+  }
+  const int file_descriptor = open(path.c_str(), O_WRONLY | O_NONBLOCK);
+  if (file_descriptor < 0) {
+    usb_log("connection.failed path=" + path + " errno=" + std::to_string(errno));
+    return false;
+  }
+  close(file_descriptor);
+  usb_log("connection.checked path=" + path + " connected=1");
+  return true;
+}
+
+static bool print_usb_printer(const std::string& path, const std::vector<uint8_t>& bytes) {
+  if (!can_access_usb_printer(path)) return false;
+  if (bytes.empty()) return true;
+
+  const int file_descriptor = open(path.c_str(), O_WRONLY | O_NONBLOCK);
+  if (file_descriptor < 0) {
+    usb_log("print.failed stage=open path=" + path + " errno=" + std::to_string(errno));
+    return false;
+  }
+
+  size_t offset = 0;
+  while (offset < bytes.size()) {
+    const ssize_t written = write(file_descriptor, bytes.data() + offset, bytes.size() - offset);
+    if (written <= 0) {
+      usb_log(
+          "print.failed stage=write path=" + path + " offset=" + std::to_string(offset) +
+          " errno=" + std::to_string(errno));
+      close(file_descriptor);
+      return false;
+    }
+    offset += static_cast<size_t>(written);
+  }
+  close(file_descriptor);
+  usb_log("print.success path=" + path + " bytes=" + std::to_string(bytes.size()));
+  return true;
+}
+
 static bool bluetooth_address_from_string(const std::string& address, bdaddr_t* result) {
   if (result == nullptr || address.empty()) return false;
   return str2ba(address.c_str(), result) == 0;
@@ -480,6 +536,13 @@ static void method_call_cb(FlMethodChannel* channel,
       start_bluetooth_operation(operation);
       return;
     }
+    if (connection_type == "USB") {
+      const auto path = map_get_string(args, "address");
+      g_autoptr(FlValue) result = fl_value_new_bool(can_access_usb_printer(path) ? TRUE : FALSE);
+      response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
+      fl_method_call_respond(method_call, response, nullptr);
+      return;
+    }
     const std::string name = map_get_string(args, "name");
     const bool found = cups_printer_exists(name.c_str());
     g_autoptr(FlValue) result = fl_value_new_bool(found ? TRUE : FALSE);
@@ -503,6 +566,13 @@ static void method_call_cb(FlMethodChannel* channel,
           address,
       };
       start_bluetooth_operation(operation);
+      return;
+    }
+    if (connection_type == "USB") {
+      const auto path = map_get_string(args, "address");
+      g_autoptr(FlValue) result = fl_value_new_bool(can_access_usb_printer(path) ? TRUE : FALSE);
+      response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
+      fl_method_call_respond(method_call, response, nullptr);
       return;
     }
     // The Dart layer sends vendorId = CUPS queue name (set in getUsbDevicesList).
@@ -541,6 +611,22 @@ static void method_call_cb(FlMethodChannel* channel,
           start_bluetooth_operation(operation);
           return;
         }
+      } else if (connection_type == "USB") {
+        const auto path = map_get_string(args, "address");
+        FlValue* data_val = fl_value_lookup_string(args, "data");
+        const auto data_bytes = bytes_from_value(data_val);
+        if (path.empty() || data_bytes.empty()) {
+          response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+              "INVALID_ARGS", "USB printer path or data is missing", nullptr));
+        } else if (print_usb_printer(path, data_bytes)) {
+          g_autoptr(FlValue) result = fl_value_new_bool(TRUE);
+          response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
+        } else {
+          response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+              "PRINT_ERROR", "Unable to write data to the USB printer", nullptr));
+        }
+        fl_method_call_respond(method_call, response, nullptr);
+        return;
       } else if (printer_name.empty()) {
         printer_name = map_get_string(args, "vendorId");
       }
