@@ -4,6 +4,9 @@ import IOBluetooth
 final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMChannelDelegate {
   private var channelsByAddress = [String: IOBluetoothRFCOMMChannel]()
   private var pendingConnections = [String: MacOSBluetoothSdpQuery]()
+  // Keep cancelled queries alive until IOBluetooth finishes its native
+  // callback. Otherwise the Objective-C delegate can become dangling.
+  private var cancelledConnections = [UUID: MacOSBluetoothSdpQuery]()
   private var pendingWrites = [String: PendingWrite]()
 
   func connect(address: String, completion: @escaping (Result<Void, Error>) -> Void) {
@@ -27,11 +30,15 @@ final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMCh
     }
 
     disconnect(address: normalizedAddress)
+    let queryID = UUID()
     let query = MacOSBluetoothSdpQuery(
+      id: queryID,
       device: device,
       onCompleted: { [weak self] result in
         guard let self else { return }
-        self.pendingConnections[normalizedAddress] = nil
+        if self.pendingConnections[normalizedAddress]?.id == queryID {
+          self.pendingConnections[normalizedAddress] = nil
+        }
         switch result {
         case .failure(let error):
           self.log("sdp.failed address=\(normalizedAddress) error=\(error.localizedDescription)")
@@ -44,6 +51,9 @@ final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMCh
             completion: completion
           )
         }
+      },
+      onNativeOperationFinished: { [weak self] in
+        self?.cancelledConnections.removeValue(forKey: queryID)
       }
     )
     pendingConnections[normalizedAddress] = query
@@ -58,7 +68,10 @@ final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMCh
 
   func disconnect(address: String) {
     let normalizedAddress = normalize(address)
-    pendingConnections.removeValue(forKey: normalizedAddress)?.cancel()
+    if let query = pendingConnections.removeValue(forKey: normalizedAddress) {
+      cancelledConnections[query.id] = query
+      query.cancel()
+    }
     guard let channel = channelsByAddress.removeValue(forKey: normalizedAddress) else { return }
     let status = channel.close()
     log("disconnect.completed address=\(normalizedAddress) status=\(status)")
@@ -197,16 +210,23 @@ private struct PendingWrite {
 }
 
 private final class MacOSBluetoothSdpQuery: NSObject {
+  let id: UUID
   private let device: IOBluetoothDevice
   private let onCompleted: (Result<BluetoothRFCOMMChannelID, Error>) -> Void
+  private let onNativeOperationFinished: () -> Void
   private var completed = false
+  private var cancelled = false
 
   init(
+    id: UUID,
     device: IOBluetoothDevice,
-    onCompleted: @escaping (Result<BluetoothRFCOMMChannelID, Error>) -> Void
+    onCompleted: @escaping (Result<BluetoothRFCOMMChannelID, Error>) -> Void,
+    onNativeOperationFinished: @escaping () -> Void
   ) {
+    self.id = id
     self.device = device
     self.onCompleted = onCompleted
+    self.onNativeOperationFinished = onNativeOperationFinished
   }
 
   func start() {
@@ -228,6 +248,8 @@ private final class MacOSBluetoothSdpQuery: NSObject {
   @objc(connectionComplete:status:)
   func connectionComplete(_ device: IOBluetoothDevice!, status: IOReturn) {
     NSLog("[FlutterThermalPrinterNative] macos.bluetooth baseband.completed status=\(status)")
+    defer { onNativeOperationFinished() }
+    guard !cancelled else { return }
     guard status == kIOReturnSuccess else {
       complete(.failure(MacOSBluetoothTransportError.basebandConnectionFailed(status)))
       return
@@ -244,12 +266,23 @@ private final class MacOSBluetoothSdpQuery: NSObject {
   }
 
   func cancel() {
+    guard !cancelled else { return }
+    cancelled = true
+    // Abort the native baseband/SDP operation. The transport retains this
+    // query until the late native callback arrives.
+    _ = device.closeConnection()
+    NSLog(
+      "[FlutterThermalPrinterNative] macos.bluetooth query.cancelled " +
+        "address=\(device.addressString ?? "unknown")"
+    )
     complete(.failure(MacOSBluetoothTransportError.connectionCancelled))
   }
 
   @objc(sdpQueryComplete:status:)
   func sdpQueryComplete(_ sender: IOBluetoothDevice!, status: IOReturn) {
     NSLog("[FlutterThermalPrinterNative] macos.bluetooth sdp.callback status=\(status)")
+    defer { onNativeOperationFinished() }
+    guard !cancelled else { return }
     guard status == kIOReturnSuccess else {
       complete(.failure(MacOSBluetoothTransportError.sdpQueryFailed(status)))
       return
