@@ -64,6 +64,7 @@ class FlutterThermalPrinterPlugin : public flutter::Plugin {
   std::thread print_worker_;
   std::shared_ptr<std::atomic_bool> print_worker_done_;
   CancellationToken print_worker_cancellation_;
+  std::atomic<int64_t> print_operation_id_ = 0;
 };
 
 }  // namespace flutter_thermal_printer

@@ -47,6 +47,10 @@ void UsbLog(const std::wstring& message) {
   OutputDebugStringW((L"[FlutterThermalPrinterNative] windows.usb " + message + L"\n").c_str());
 }
 
+void PrintLog(const std::wstring& message) {
+  OutputDebugStringW((L"[FlutterThermalPrinterNative] windows.print " + message + L"\n").c_str());
+}
+
 std::wstring WideFromUtf8(const std::string& value) {
   if (value.empty()) return L"";
   const int size = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, nullptr, 0);
@@ -176,9 +180,12 @@ FlutterThermalPrinterPlugin::~FlutterThermalPrinterPlugin() {
 void FlutterThermalPrinterPlugin::StartPrintWorker(
     PrintOperation operation,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  const auto operation_id = ++print_operation_id_;
   std::lock_guard lock(print_worker_mutex_);
   if (print_worker_.joinable()) {
     if (print_worker_done_ == nullptr || !print_worker_done_->load()) {
+      PrintLog(L"rejected id=" + std::to_wstring(operation_id) +
+               L" reason=busy");
       result->Error("PRINT_BUSY", "Another Windows print operation is still running.");
       return;
     }
@@ -191,16 +198,22 @@ void FlutterThermalPrinterPlugin::StartPrintWorker(
   print_worker_cancellation_ = cancellation;
   print_worker_ = std::thread([
       operation = std::move(operation), result = std::move(result), done,
-      cancellation]() mutable {
+      cancellation, operation_id]() mutable {
+        PrintLog(L"started id=" + std::to_wstring(operation_id));
         bool success = false;
         try {
           success = operation(cancellation);
           if (cancellation->load()) {
+            PrintLog(L"cancelled id=" + std::to_wstring(operation_id));
             result->Error("PRINT_CANCELLED", "Windows print operation was cancelled.");
           } else {
+            PrintLog((success ? L"completed id=" : L"failed id=") +
+                     std::to_wstring(operation_id));
             result->Success(EncodableValue(success));
           }
         } catch (...) {
+          PrintLog(L"failed id=" + std::to_wstring(operation_id) +
+                   L" reason=exception");
           result->Error("PRINT_FAILED", "Windows print operation failed unexpectedly.");
         }
         done->store(true);
@@ -302,7 +315,7 @@ bool FlutterThermalPrinterPlugin::PrintBluetoothClassic(
   if (cancellation != nullptr && cancellation->load()) return false;
   const auto normalized_address = NormalizeAddress(address);
   if (normalized_address.empty()) {
-    BluetoothLog(L"print.failed reason=invalid_address");
+    BluetoothLog(L"print.failed code=BLUETOOTH_INVALID_ADDRESS");
     return false;
   }
   if (bytes.empty()) {
@@ -324,7 +337,8 @@ bool FlutterThermalPrinterPlugin::PrintBluetoothClassic(
       shutdown(socket_handle, SD_BOTH);
       closesocket(socket_handle);
       bluetooth_sockets_.erase(socket_iterator);
-      BluetoothLog(L"print.cancelled address=" + WideFromUtf8(normalized_address));
+      BluetoothLog(L"print.cancelled code=PRINT_CANCELLED address=" +
+                   WideFromUtf8(normalized_address));
       return false;
     }
     const auto remaining = bytes.size() - offset;
@@ -336,8 +350,9 @@ bool FlutterThermalPrinterPlugin::PrintBluetoothClassic(
     wait_time.tv_usec = 100'000;
     const auto writable = select(0, nullptr, &write_set, nullptr, &wait_time);
     if (writable == SOCKET_ERROR) {
-      BluetoothLog(L"print.failed address=" + WideFromUtf8(normalized_address) +
-                   L" stage=select error=" + std::to_wstring(WSAGetLastError()));
+      BluetoothLog(L"print.failed code=BLUETOOTH_WRITE_WAIT_FAILED address=" +
+                   WideFromUtf8(normalized_address) +
+                   L" error=" + std::to_wstring(WSAGetLastError()));
       shutdown(socket_handle, SD_BOTH);
       closesocket(socket_handle);
       bluetooth_sockets_.erase(socket_iterator);
@@ -347,7 +362,8 @@ bool FlutterThermalPrinterPlugin::PrintBluetoothClassic(
     const int sent = send(socket_handle, reinterpret_cast<const char*>(bytes.data() + offset), chunk_size, 0);
     if (sent == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) continue;
     if (sent <= 0) {
-      BluetoothLog(L"print.failed address=" + WideFromUtf8(normalized_address) +
+      BluetoothLog(L"print.failed code=BLUETOOTH_WRITE_FAILED address=" +
+                   WideFromUtf8(normalized_address) +
                    L" offset=" + std::to_wstring(offset) +
                    L" error=" + std::to_wstring(WSAGetLastError()));
       shutdown(socket_handle, SD_BOTH);
@@ -439,7 +455,7 @@ bool FlutterThermalPrinterPlugin::PrintUsbPrinter(
 
   const auto wide_path = WideFromUtf8(device_path);
   if (wide_path.empty()) {
-    UsbLog(L"print.failed reason=empty_path");
+    UsbLog(L"print.failed code=USB_EMPTY_DEVICE_PATH");
     return false;
   }
 
@@ -452,13 +468,14 @@ bool FlutterThermalPrinterPlugin::PrintUsbPrinter(
       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
       nullptr);
   if (handle == INVALID_HANDLE_VALUE) {
-    UsbLog(L"print.failed stage=open error=" + std::to_wstring(GetLastError()));
+    UsbLog(L"print.failed code=USB_OPEN_FAILED error=" + std::to_wstring(GetLastError()));
     return false;
   }
 
   HANDLE completion_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   if (completion_event == nullptr) {
-    UsbLog(L"print.failed stage=create_event error=" + std::to_wstring(GetLastError()));
+    UsbLog(L"print.failed code=USB_COMPLETION_EVENT_FAILED error=" +
+           std::to_wstring(GetLastError()));
     CloseHandle(handle);
     return false;
   }
@@ -469,7 +486,7 @@ bool FlutterThermalPrinterPlugin::PrintUsbPrinter(
   UsbLog(L"print.started bytes=" + std::to_wstring(bytes.size()));
   while (offset < bytes.size()) {
     if (cancellation != nullptr && cancellation->load()) {
-      UsbLog(L"print.cancelled offset=" + std::to_wstring(offset));
+      UsbLog(L"print.cancelled code=PRINT_CANCELLED offset=" + std::to_wstring(offset));
       success = false;
       break;
     }
@@ -489,7 +506,7 @@ bool FlutterThermalPrinterPlugin::PrintUsbPrinter(
     if (write_started == FALSE) {
       const auto write_error = GetLastError();
       if (write_error != ERROR_IO_PENDING) {
-        UsbLog(L"print.failed stage=write offset=" + std::to_wstring(offset) +
+        UsbLog(L"print.failed code=USB_WRITE_FAILED offset=" + std::to_wstring(offset) +
                L" error=" + std::to_wstring(write_error));
         success = false;
         break;
@@ -501,7 +518,8 @@ bool FlutterThermalPrinterPlugin::PrintUsbPrinter(
       while (std::chrono::steady_clock::now() < deadline) {
         if (cancellation != nullptr && cancellation->load()) {
           CancelIoEx(handle, &overlapped);
-          UsbLog(L"print.cancelled offset=" + std::to_wstring(offset));
+          UsbLog(L"print.cancelled code=PRINT_CANCELLED offset=" +
+                 std::to_wstring(offset));
           success = false;
           break;
         }
@@ -516,7 +534,8 @@ bool FlutterThermalPrinterPlugin::PrintUsbPrinter(
         if (!success && cancellation != nullptr && cancellation->load()) break;
         const auto completion_error = GetLastError();
         CancelIoEx(handle, &overlapped);
-        UsbLog(L"print.failed stage=completion offset=" + std::to_wstring(offset) +
+        UsbLog(L"print.failed code=USB_WRITE_COMPLETION_FAILED offset=" +
+               std::to_wstring(offset) +
                L" wait=" + std::to_wstring(wait_result) +
                L" error=" + std::to_wstring(completion_error));
         success = false;
@@ -525,7 +544,7 @@ bool FlutterThermalPrinterPlugin::PrintUsbPrinter(
     }
 
     if (written != chunk_size) {
-      UsbLog(L"print.failed stage=partial_write offset=" + std::to_wstring(offset) +
+      UsbLog(L"print.failed code=USB_PARTIAL_WRITE offset=" + std::to_wstring(offset) +
              L" expected=" + std::to_wstring(chunk_size) +
              L" actual=" + std::to_wstring(written));
       success = false;
