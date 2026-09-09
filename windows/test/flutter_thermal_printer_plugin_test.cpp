@@ -2,6 +2,10 @@
 #include <flutter/method_result_functions.h>
 #include <flutter/standard_method_codec.h>
 #include <gtest/gtest.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
 #include <windows.h>
 
 #include <memory>
