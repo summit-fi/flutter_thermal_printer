@@ -34,8 +34,11 @@ namespace {
 using flutter::EncodableList;
 using flutter::EncodableMap;
 using flutter::EncodableValue;
+using MethodResult = flutter::MethodResult<EncodableValue>;
+using ResultHolder = std::shared_ptr<std::unique_ptr<MethodResult>>;
 
 constexpr auto kBluetoothConnectTimeout = std::chrono::seconds(10);
+constexpr auto kTransportOperationTimeout = std::chrono::seconds(30);
 constexpr size_t kBluetoothWriteChunkSize = 1'024;
 constexpr DWORD kUsbWriteTimeoutMs = 10'000;
 
@@ -52,6 +55,48 @@ void UsbLog(const std::wstring& message) {
 /// Writes print lifecycle diagnostics to the Windows debugger output.
 void PrintLog(const std::wstring& message) {
   OutputDebugStringW((L"[FlutterThermalPrinterNative] windows.print " + message + L"\n").c_str());
+}
+
+/// Writes connection lifecycle diagnostics to the Windows debugger output.
+void TransportLog(const std::wstring& message) {
+  OutputDebugStringW((L"[FlutterThermalPrinterNative] windows.transport " + message + L"\n").c_str());
+}
+
+int64_t DurationMilliseconds(const std::chrono::steady_clock::time_point& started_at) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now() - started_at)
+      .count();
+}
+
+bool TakeResult(const ResultHolder& holder,
+                const std::shared_ptr<std::mutex>& result_mutex,
+                const std::shared_ptr<std::atomic_bool>& completed,
+                std::unique_ptr<MethodResult>* result) {
+  if (completed->exchange(true)) return false;
+  std::lock_guard lock(*result_mutex);
+  *result = std::move(*holder);
+  return *result != nullptr;
+}
+
+void CompleteResultError(const ResultHolder& holder,
+                         const std::shared_ptr<std::mutex>& result_mutex,
+                         const std::shared_ptr<std::atomic_bool>& completed,
+                         const char* code,
+                         const char* message) {
+  std::unique_ptr<MethodResult> result;
+  if (TakeResult(holder, result_mutex, completed, &result)) {
+    result->Error(code, message);
+  }
+}
+
+void CompleteResultBool(const ResultHolder& holder,
+                        const std::shared_ptr<std::mutex>& result_mutex,
+                        const std::shared_ptr<std::atomic_bool>& completed,
+                        bool value) {
+  std::unique_ptr<MethodResult> result;
+  if (TakeResult(holder, result_mutex, completed, &result)) {
+    result->Success(EncodableValue(value));
+  }
 }
 
 /// Converts UTF-8 input received from Dart to a Windows string.
@@ -175,6 +220,13 @@ FlutterThermalPrinterPlugin::~FlutterThermalPrinterPlugin() {
       print_worker_.join();
     }
   }
+  CancelConnection();
+  {
+    std::lock_guard lock(connection_worker_mutex_);
+    if (connection_worker_.joinable()) {
+      connection_worker_.join();
+    }
+  }
   std::lock_guard lock(bluetooth_sockets_mutex_);
   for (const auto& [address, socket_handle] : bluetooth_sockets_) {
     BluetoothLog(L"disconnect.cleanup address=" + WideFromUtf8(address));
@@ -187,8 +239,15 @@ FlutterThermalPrinterPlugin::~FlutterThermalPrinterPlugin() {
 
 void FlutterThermalPrinterPlugin::StartPrintWorker(
     PrintOperation operation,
+    const std::string& transport,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
   const auto operation_id = ++print_operation_id_;
+  if (connection_active_.load()) {
+    PrintLog(L"rejected id=" + std::to_wstring(operation_id) +
+             L" transport=" + WideFromUtf8(transport) + L" reason=connection_busy");
+    result->Error("TRANSPORT_BUSY", "A Windows transport operation is still running.");
+    return;
+  }
   std::lock_guard lock(print_worker_mutex_);
   if (print_worker_.joinable()) {
     if (print_worker_done_ == nullptr || !print_worker_done_->load()) {
@@ -202,39 +261,230 @@ void FlutterThermalPrinterPlugin::StartPrintWorker(
 
   const auto done = std::make_shared<std::atomic_bool>(false);
   const auto cancellation = std::make_shared<std::atomic_bool>(false);
+  const auto timed_out = std::make_shared<std::atomic_bool>(false);
+  const auto completed = std::make_shared<std::atomic_bool>(false);
+  const auto result_mutex = std::make_shared<std::mutex>();
+  const auto result_holder = std::make_shared<std::unique_ptr<MethodResult>>(
+      std::move(result));
+  const auto started_at = std::chrono::steady_clock::now();
   print_worker_done_ = done;
   print_worker_cancellation_ = cancellation;
+  print_cancel_completion_ = [completed, result_mutex, result_holder] {
+    CompleteResultError(result_holder, result_mutex, completed,
+                        "TRANSPORT_CANCELLED",
+                        "Windows print operation was cancelled.");
+  };
+  print_active_.store(true);
   print_worker_ = std::thread([
-      operation = std::move(operation), result = std::move(result), done,
-      cancellation, operation_id]() mutable {
-        PrintLog(L"started id=" + std::to_wstring(operation_id));
+      operation = std::move(operation), done, cancellation, timed_out,
+      completed, result_mutex, result_holder, started_at, transport,
+      operation_id,
+      this]() mutable {
+        PrintLog(L"started id=" + std::to_wstring(operation_id) +
+                 L" transport=" + WideFromUtf8(transport));
         bool success = false;
         try {
           success = operation(cancellation);
-          if (cancellation->load()) {
-            PrintLog(L"cancelled id=" + std::to_wstring(operation_id));
-            result->Error("PRINT_CANCELLED", "Windows print operation was cancelled.");
+          done->store(true);
+          if (timed_out->load()) {
+            PrintLog(L"timeout id=" + std::to_wstring(operation_id) +
+                     L" transport=" + WideFromUtf8(transport) +
+                     L" errorCode=TRANSPORT_TIMEOUT" +
+                     L" durationMs=" + std::to_wstring(DurationMilliseconds(started_at)));
+            CompleteResultError(result_holder, result_mutex, completed,
+                                "TRANSPORT_TIMEOUT",
+                                "Windows print operation timed out.");
+          } else if (cancellation->load()) {
+            PrintLog(L"cancelled id=" + std::to_wstring(operation_id) +
+                     L" transport=" + WideFromUtf8(transport) +
+                     L" errorCode=TRANSPORT_CANCELLED" +
+                     L" durationMs=" + std::to_wstring(DurationMilliseconds(started_at)));
+            CompleteResultError(result_holder, result_mutex, completed,
+                                "TRANSPORT_CANCELLED",
+                                "Windows print operation was cancelled.");
           } else {
             PrintLog((success ? L"completed id=" : L"failed id=") +
-                     std::to_wstring(operation_id));
-            result->Success(EncodableValue(success));
-          }
-        } catch (...) {
-          PrintLog(L"failed id=" + std::to_wstring(operation_id) +
-                   L" reason=exception");
-          result->Error("PRINT_FAILED", "Windows print operation failed unexpectedly.");
+                     std::to_wstring(operation_id) +
+                     L" transport=" + WideFromUtf8(transport) +
+                     (success ? L" errorCode=SUCCESS" : L" errorCode=TRANSPORT_FAILED") +
+                     L" durationMs=" + std::to_wstring(DurationMilliseconds(started_at)));
+            if (success) {
+              CompleteResultBool(result_holder, result_mutex, completed, true);
+            } else {
+              CompleteResultError(result_holder, result_mutex, completed,
+                                  "TRANSPORT_FAILED",
+                                  "Windows print operation failed.");
+            }
         }
-        done->store(true);
+        print_active_.store(false);
+      } catch (...) {
+          done->store(true);
+          PrintLog(L"failed id=" + std::to_wstring(operation_id) +
+                   L" transport=" + WideFromUtf8(transport) +
+                   L" errorCode=TRANSPORT_FAILED" +
+                   L" reason=exception durationMs=" +
+                   std::to_wstring(DurationMilliseconds(started_at)));
+          CompleteResultError(result_holder, result_mutex, completed,
+                              "TRANSPORT_FAILED",
+                              "Windows print operation failed unexpectedly.");
+          print_active_.store(false);
+        }
       });
+  std::thread([done, cancellation, timed_out, completed, result_mutex,
+               result_holder, started_at, transport, operation_id] {
+    std::this_thread::sleep_for(kTransportOperationTimeout);
+    if (done->load() || completed->load()) return;
+    timed_out->store(true);
+    cancellation->store(true);
+    PrintLog(L"timeout.requested id=" + std::to_wstring(operation_id) +
+             L" transport=" + WideFromUtf8(transport) +
+             L" errorCode=TRANSPORT_TIMEOUT" +
+             L" durationMs=" + std::to_wstring(DurationMilliseconds(started_at)));
+    CompleteResultError(result_holder, result_mutex, completed,
+                        "TRANSPORT_TIMEOUT",
+                        "Windows print operation timed out.");
+  }).detach();
 }
 
 void FlutterThermalPrinterPlugin::CancelPrint() {
   std::shared_ptr<std::atomic_bool> cancellation;
+  std::function<void()> complete;
   {
     std::lock_guard lock(print_worker_mutex_);
     cancellation = print_worker_cancellation_;
+    complete = print_cancel_completion_;
   }
   if (cancellation != nullptr) cancellation->store(true);
+  if (complete) complete();
+}
+
+void FlutterThermalPrinterPlugin::StartConnectionWorker(
+    PrintOperation operation,
+    const std::string& transport,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result,
+    bool return_false_as_value) {
+  const auto operation_id = ++connection_operation_id_;
+  if (print_active_.load()) {
+    TransportLog(L"connection.rejected id=" + std::to_wstring(operation_id) +
+                 L" transport=" + WideFromUtf8(transport) + L" reason=print_busy");
+    result->Error("TRANSPORT_BUSY", "A Windows print operation is still running.");
+    return;
+  }
+  CancelConnection();
+
+  std::lock_guard lock(connection_worker_mutex_);
+  if (connection_worker_.joinable()) connection_worker_.join();
+
+  const auto done = std::make_shared<std::atomic_bool>(false);
+  const auto cancellation = std::make_shared<std::atomic_bool>(false);
+  const auto timed_out = std::make_shared<std::atomic_bool>(false);
+  const auto completed = std::make_shared<std::atomic_bool>(false);
+  const auto result_mutex = std::make_shared<std::mutex>();
+  const auto result_holder = std::make_shared<std::unique_ptr<MethodResult>>(
+      std::move(result));
+  const auto started_at = std::chrono::steady_clock::now();
+  connection_worker_done_ = done;
+  connection_worker_cancellation_ = cancellation;
+  connection_cancel_completion_ = [completed, result_mutex, result_holder] {
+    CompleteResultError(result_holder, result_mutex, completed,
+                        "TRANSPORT_CANCELLED",
+                        "Windows transport connection was cancelled.");
+  };
+  connection_active_.store(true);
+  connection_worker_ = std::thread([
+      operation = std::move(operation), done, cancellation, timed_out,
+      completed, result_mutex, result_holder, started_at, transport,
+      operation_id, return_false_as_value, this]() mutable {
+    TransportLog(L"connection.started id=" + std::to_wstring(operation_id) +
+                 L" transport=" + WideFromUtf8(transport));
+    bool success = false;
+    try {
+      success = operation(cancellation);
+      done->store(true);
+      if (timed_out->load()) {
+        TransportLog(L"connection.timeout id=" + std::to_wstring(operation_id) +
+                     L" transport=" + WideFromUtf8(transport) +
+                     L" errorCode=TRANSPORT_TIMEOUT" +
+                     L" durationMs=" + std::to_wstring(DurationMilliseconds(started_at)));
+        CompleteResultError(result_holder, result_mutex, completed,
+                            "TRANSPORT_TIMEOUT",
+                            "Windows transport connection timed out.");
+      } else if (cancellation->load()) {
+        TransportLog(L"connection.cancelled id=" + std::to_wstring(operation_id) +
+                     L" transport=" + WideFromUtf8(transport) +
+                     L" errorCode=TRANSPORT_CANCELLED" +
+                     L" durationMs=" + std::to_wstring(DurationMilliseconds(started_at)));
+        CompleteResultError(result_holder, result_mutex, completed,
+                            "TRANSPORT_CANCELLED",
+                            "Windows transport connection was cancelled.");
+      } else if (success) {
+        TransportLog(L"connection.completed id=" + std::to_wstring(operation_id) +
+                     L" transport=" + WideFromUtf8(transport) +
+                     L" errorCode=SUCCESS" +
+                     L" durationMs=" + std::to_wstring(DurationMilliseconds(started_at)));
+        CompleteResultBool(result_holder, result_mutex, completed, true);
+      } else if (return_false_as_value) {
+        TransportLog(L"connection.checked id=" + std::to_wstring(operation_id) +
+                     L" transport=" + WideFromUtf8(transport) +
+                     L" errorCode=DEVICE_UNAVAILABLE" +
+                     L" durationMs=" + std::to_wstring(DurationMilliseconds(started_at)));
+        CompleteResultBool(result_holder, result_mutex, completed, false);
+      } else {
+        TransportLog(L"connection.failed id=" + std::to_wstring(operation_id) +
+                     L" transport=" + WideFromUtf8(transport) +
+                     L" errorCode=" +
+                     WideFromUtf8(transport == "bluetoothClassic"
+                                      ? "BLUETOOTH_CONNECT_FAILED"
+                                      : "USB_OPEN_FAILED") +
+                     L" durationMs=" + std::to_wstring(DurationMilliseconds(started_at)));
+        CompleteResultError(
+            result_holder, result_mutex, completed,
+            transport == "bluetoothClassic" ? "BLUETOOTH_CONNECT_FAILED" : "USB_OPEN_FAILED",
+            transport == "bluetoothClassic"
+                ? "Windows could not connect to the Bluetooth printer."
+                : "Windows could not open the USB printer.");
+      }
+      connection_active_.store(false);
+    } catch (...) {
+      done->store(true);
+      TransportLog(L"connection.failed id=" + std::to_wstring(operation_id) +
+                   L" transport=" + WideFromUtf8(transport) +
+                   L" errorCode=TRANSPORT_CONNECT_FAILED" +
+                   L" reason=exception durationMs=" +
+                   std::to_wstring(DurationMilliseconds(started_at)));
+      CompleteResultError(result_holder, result_mutex, completed,
+                          "TRANSPORT_CONNECT_FAILED",
+                          "Windows transport connection failed unexpectedly.");
+      connection_active_.store(false);
+    }
+  });
+
+  std::thread([done, cancellation, timed_out, completed, result_mutex,
+               result_holder, started_at, transport, operation_id] {
+    std::this_thread::sleep_for(kTransportOperationTimeout);
+    if (done->load() || completed->load()) return;
+    timed_out->store(true);
+    cancellation->store(true);
+    TransportLog(L"connection.timeout.requested id=" + std::to_wstring(operation_id) +
+                 L" transport=" + WideFromUtf8(transport) +
+             L" errorCode=TRANSPORT_TIMEOUT" +
+             L" durationMs=" + std::to_wstring(DurationMilliseconds(started_at)));
+    CompleteResultError(result_holder, result_mutex, completed,
+                        "TRANSPORT_TIMEOUT",
+                        "Windows transport connection timed out.");
+  }).detach();
+}
+
+void FlutterThermalPrinterPlugin::CancelConnection() {
+  std::shared_ptr<std::atomic_bool> cancellation;
+  std::function<void()> complete;
+  {
+    std::lock_guard lock(connection_worker_mutex_);
+    cancellation = connection_worker_cancellation_;
+    complete = connection_cancel_completion_;
+  }
+  if (cancellation != nullptr) cancellation->store(true);
+  if (complete) complete();
 }
 
 bool FlutterThermalPrinterPlugin::ConnectBluetoothClassic(
@@ -587,8 +837,17 @@ void FlutterThermalPrinterPlugin::HandleMethodCall(
     }
     result->Success(flutter::EncodableValue(version_stream.str()));
   } else if (method_call.method_name().compare("connect") == 0 && is_bluetooth_classic) {
-    result->Success(EncodableValue(
-        ConnectBluetoothClassic(StringValue(*arguments, "address"), nullptr)));
+    const auto address = StringValue(*arguments, "address");
+    if (NormalizeAddress(address).empty()) {
+      result->Error("DEVICE_UNAVAILABLE", "The Bluetooth printer address is missing or invalid.");
+      return;
+    }
+    StartConnectionWorker(
+        [this, address](const CancellationToken& cancellation) {
+          return ConnectBluetoothClassic(address, cancellation);
+        },
+        "bluetoothClassic",
+        std::move(result));
   } else if (method_call.method_name().compare("printText") == 0 && is_bluetooth_classic) {
     const auto address = StringValue(*arguments, "address");
     const auto bytes = BytesValue(*arguments, "data");
@@ -596,16 +855,42 @@ void FlutterThermalPrinterPlugin::HandleMethodCall(
         [this, address, bytes](const CancellationToken& cancellation) {
           return PrintBluetoothClassic(address, bytes, cancellation);
         },
+        "bluetoothClassic",
         std::move(result));
   } else if (method_call.method_name().compare("cancelPrint") == 0) {
     CancelPrint();
     result->Success();
+  } else if (method_call.method_name().compare("cancelConnect") == 0) {
+    CancelConnection();
+    result->Success();
   } else if (method_call.method_name().compare("isConnected") == 0 && is_bluetooth_classic) {
-    result->Success(EncodableValue(IsBluetoothClassicConnected(StringValue(*arguments, "address"))));
+    const auto address = StringValue(*arguments, "address");
+    StartConnectionWorker(
+        [this, address](const CancellationToken&) {
+          return IsBluetoothClassicConnected(address);
+        },
+        "bluetoothClassic.status",
+        std::move(result), true);
   } else if (method_call.method_name().compare("disconnect") == 0 && is_bluetooth_classic) {
-    result->Success(EncodableValue(DisconnectBluetoothClassic(StringValue(*arguments, "address"))));
+    const auto address = StringValue(*arguments, "address");
+    StartConnectionWorker(
+        [this, address](const CancellationToken&) {
+          return DisconnectBluetoothClassic(address);
+        },
+        "bluetoothClassic.disconnect",
+        std::move(result), true);
   } else if (method_call.method_name().compare("connect") == 0 && is_usb) {
-    result->Success(EncodableValue(CanOpenUsbPrinter(StringValue(*arguments, "address"))));
+    const auto device_path = StringValue(*arguments, "address");
+    if (device_path.empty()) {
+      result->Error("DEVICE_UNAVAILABLE", "The USB printer device path is missing.");
+      return;
+    }
+    StartConnectionWorker(
+        [device_path](const CancellationToken&) {
+          return CanOpenUsbPrinter(device_path);
+        },
+        "usb",
+        std::move(result));
   } else if (method_call.method_name().compare("printText") == 0 && is_usb) {
     const auto device_path = StringValue(*arguments, "address");
     const auto bytes = BytesValue(*arguments, "data");
@@ -613,11 +898,21 @@ void FlutterThermalPrinterPlugin::HandleMethodCall(
         [device_path, bytes](const CancellationToken& cancellation) {
           return PrintUsbPrinter(device_path, bytes, cancellation);
         },
+        "usb",
         std::move(result));
   } else if (method_call.method_name().compare("isConnected") == 0 && is_usb) {
-    result->Success(EncodableValue(CanOpenUsbPrinter(StringValue(*arguments, "address"))));
+    const auto device_path = StringValue(*arguments, "address");
+    StartConnectionWorker(
+        [this, device_path](const CancellationToken&) {
+          return CanOpenUsbPrinter(device_path);
+        },
+        "usb.status",
+        std::move(result), true);
   } else if (method_call.method_name().compare("disconnect") == 0 && is_usb) {
-    result->Success(EncodableValue(true));
+    StartConnectionWorker(
+        [](const CancellationToken&) { return true; },
+        "usb.disconnect",
+        std::move(result));
   } else {
     result->NotImplemented();
   }

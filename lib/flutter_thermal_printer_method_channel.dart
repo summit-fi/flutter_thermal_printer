@@ -26,6 +26,11 @@ class MethodChannelFlutterThermalPrinter extends FlutterThermalPrinterPlatform {
       await methodChannel.invokeMethod('connect', device.toJson());
 
   @override
+  Future<void> cancelConnect() async {
+    await methodChannel.invokeMethod<void>('cancelConnect');
+  }
+
+  @override
   Future<bool> printText(
     Printer device,
     Uint8List data, {

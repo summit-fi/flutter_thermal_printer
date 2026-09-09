@@ -69,7 +69,16 @@ class FlutterThermalPrinterPlugin : public flutter::Plugin {
   /// Runs one print operation off the method-channel thread and completes its result.
   void StartPrintWorker(
       PrintOperation operation,
+      const std::string& transport,
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  /// Runs a transport connection check off the method-channel thread.
+  void StartConnectionWorker(
+      PrintOperation operation,
+      const std::string& transport,
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result,
+      bool return_false_as_value = false);
+  /// Requests cancellation of the active connection operation.
+  void CancelConnection();
 
   std::unordered_map<std::string, SOCKET> bluetooth_sockets_;
   std::mutex bluetooth_sockets_mutex_;
@@ -77,7 +86,16 @@ class FlutterThermalPrinterPlugin : public flutter::Plugin {
   std::thread print_worker_;
   std::shared_ptr<std::atomic_bool> print_worker_done_;
   CancellationToken print_worker_cancellation_;
+  std::function<void()> print_cancel_completion_;
+  std::atomic_bool print_active_ = false;
   std::atomic<int64_t> print_operation_id_ = 0;
+  std::mutex connection_worker_mutex_;
+  std::thread connection_worker_;
+  std::shared_ptr<std::atomic_bool> connection_worker_done_;
+  CancellationToken connection_worker_cancellation_;
+  std::function<void()> connection_cancel_completion_;
+  std::atomic_bool connection_active_ = false;
+  std::atomic<int64_t> connection_operation_id_ = 0;
 };
 
 }  // namespace flutter_thermal_printer

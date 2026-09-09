@@ -75,6 +75,13 @@ class FlutterThermalPrinter {
       PrinterManager.instance.connect(device,
           connectionStabilizationDelay: connectionStabilizationDelay);
 
+  /// Requests cancellation of the active native connection operation.
+  Future<void> cancelConnect() async {
+    if (Platform.isWindows) {
+      await PrinterManager.instance.cancelConnect();
+    }
+  }
+
   /// Disconnect from a printer device
   Future<void> disconnect(Printer device) async {
     await PrinterManager.instance.disconnect(device);

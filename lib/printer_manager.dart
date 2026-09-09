@@ -42,6 +42,9 @@ class PrinterManager {
       <String, StreamSubscription<bool>>{};
   Timer? _bleStateSyncTimer;
   bool _isBleStateSyncInProgress = false;
+  int _bleConnectionOperationId = 0;
+  int? _activeBleConnectionOperationId;
+  Printer? _activeBleConnectionDevice;
   static const Duration _bleStateSyncInterval = Duration(seconds: 3);
 
   static const String _channelName = 'flutter_thermal_printer/events';
@@ -88,6 +91,7 @@ class PrinterManager {
   /// Dispose all resources
   Future<void> dispose() async {
     await stopScan();
+    await cancelConnect();
     await _bleAvailabilitySubscription?.cancel();
     await _devicesStream.close();
   }
@@ -105,6 +109,9 @@ class PrinterManager {
     } else if (device.connectionType == ConnectionType.BLUETOOTH_CLASSIC) {
       return FlutterThermalPrinterPlatform.instance.connect(device);
     } else if (device.connectionType == ConnectionType.BLE) {
+      final operationId = ++_bleConnectionOperationId;
+      _activeBleConnectionOperationId = operationId;
+      _activeBleConnectionDevice = device;
       try {
         if (device.address == null) {
           log('Device address is null');
@@ -135,16 +142,33 @@ class PrinterManager {
             }
           });
 
-          await device.connect();
+          await UniversalBle.connect(address).timeout(
+            bleConfig.connectionTimeout,
+          );
           final delay = connectionStabilizationDelay ??
               bleConfig.connectionStabilizationDelay;
           final connected = await connectionCompleter.future.timeout(
-            delay,
+            bleConfig.connectionTimeout,
             onTimeout: () {
-              log('Connection to device ${device.name} timed out');
+              log('BLE connection timed out operation=$operationId '
+                  'device=${device.name}');
               return false;
             },
           );
+          if (_activeBleConnectionOperationId != operationId) {
+            log('Ignoring stale BLE connection result operation=$operationId');
+            return false;
+          }
+          if (connected && delay > Duration.zero) {
+            await Future<void>.delayed(delay);
+          }
+          if (!connected) {
+            try {
+              await device.disconnect();
+            } catch (error) {
+              log('Failed to clean up BLE connection operation=$operationId: $error');
+            }
+          }
           _updateBleConnectionState(address, connected,
               fallbackName: device.name);
           return connected;
@@ -153,6 +177,10 @@ class PrinterManager {
           return false;
         } finally {
           await subscription?.cancel();
+          if (_activeBleConnectionOperationId == operationId) {
+            _activeBleConnectionOperationId = null;
+            _activeBleConnectionDevice = null;
+          }
         }
       } catch (e) {
         log('Failed to connect to BLE device: $e');
@@ -216,6 +244,25 @@ class PrinterManager {
   /// Requests cancellation of the active native print operation.
   Future<void> cancelPrint() =>
       FlutterThermalPrinterPlatform.instance.cancelPrint();
+
+  /// Requests cancellation of the active native connection operation.
+  Future<void> cancelConnect() => _cancelConnect();
+
+  Future<void> _cancelConnect() async {
+    _activeBleConnectionOperationId = null;
+    final device = _activeBleConnectionDevice;
+    _activeBleConnectionDevice = null;
+    if (device != null && device.connectionType == ConnectionType.BLE) {
+      try {
+        await device.disconnect();
+      } catch (error) {
+        log('Failed to cancel BLE connection: $error');
+      }
+    }
+    if (Platform.isWindows) {
+      await FlutterThermalPrinterPlatform.instance.cancelConnect();
+    }
+  }
 
   /// Print data to printer device
   Future<bool> printData(Printer printer, List<int> bytes,
@@ -295,7 +342,9 @@ class PrinterManager {
                   ? bytes.length
                   : i + maxChunkSize);
 
-          await writeCharacteristic.write(Uint8List.fromList(chunk));
+          await writeCharacteristic
+              .write(Uint8List.fromList(chunk))
+              .timeout(bleConfig.printTimeout);
 
           // Small delay between chunks to avoid overwhelming the device
           if (longData) {
