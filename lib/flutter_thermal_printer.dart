@@ -21,7 +21,8 @@ export 'package:universal_ble/universal_ble.dart';
 /// This class provides a unified interface for printing operations
 /// on Windows (USB/BLE) and other platforms (Android/iOS/macOS).
 class FlutterThermalPrinter {
-  FlutterThermalPrinter._({BleConfig bleConfig = const BleConfig()}) : _bleConfig = bleConfig;
+  FlutterThermalPrinter._({BleConfig bleConfig = const BleConfig()})
+      : _bleConfig = bleConfig;
 
   // ==========================================================================
   // STATIC VARIABLES AND INSTANCE
@@ -53,10 +54,12 @@ class FlutterThermalPrinter {
   // ==========================================================================
 
   /// Stream of available printers
-  Stream<List<Printer>> get devicesStream => PrinterManager.instance.devicesStream;
+  Stream<List<Printer>> get devicesStream =>
+      PrinterManager.instance.devicesStream;
 
   /// Stream to monitor Bluetooth state
-  Stream<bool> get isBleTurnedOnStream => PrinterManager.instance.isBleTurnedOnStream;
+  Stream<bool> get isBleTurnedOnStream =>
+      PrinterManager.instance.isBleTurnedOnStream;
 
   // ==========================================================================
   // PUBLIC METHODS - CORE PRINTER OPERATIONS
@@ -67,13 +70,18 @@ class FlutterThermalPrinter {
   /// [device] The printer device to connect to.
   /// [connectionStabilizationDelay] Optional delay to wait after connection is established
   /// before considering it stable. Defaults to [BleConfig.connectionStabilizationDelay].
-  Future<bool> connect(Printer device, {Duration? connectionStabilizationDelay}) async =>
-      PrinterManager.instance.connect(device, connectionStabilizationDelay: connectionStabilizationDelay);
+  Future<bool> connect(Printer device,
+          {Duration? connectionStabilizationDelay}) async =>
+      PrinterManager.instance.connect(device,
+          connectionStabilizationDelay: connectionStabilizationDelay);
 
   /// Disconnect from a printer device
   Future<void> disconnect(Printer device) async {
     await PrinterManager.instance.disconnect(device);
   }
+
+  /// Requests cancellation of the active native print operation.
+  Future<void> cancelPrint() => PrinterManager.instance.cancelPrint();
 
   /// Print raw data to printer
   ///
@@ -81,7 +89,8 @@ class FlutterThermalPrinter {
   /// [bytes] The raw bytes to print.
   /// [longData] Whether the data is long and should be split into chunks.
   /// [chunkSize] The size of each chunk if [longData] is true.
-  Future<bool> printData(Printer device, List<int> bytes, {bool longData = false, int? chunkSize}) =>
+  Future<bool> printData(Printer device, List<int> bytes,
+          {bool longData = false, int? chunkSize}) =>
       PrinterManager.instance.printData(
         device,
         bytes,
@@ -97,7 +106,10 @@ class FlutterThermalPrinter {
   /// Get available printers
   Future<void> getPrinters({
     Duration refreshDuration = const Duration(seconds: 2),
-    List<ConnectionType> connectionTypes = const [ConnectionType.USB, ConnectionType.BLE],
+    List<ConnectionType> connectionTypes = const [
+      ConnectionType.USB,
+      ConnectionType.BLE
+    ],
     bool androidUsesFineLocation = false,
   }) async {
     await PrinterManager.instance.getPrinters(
@@ -207,7 +219,9 @@ class FlutterThermalPrinter {
       );
 
       // Handle other platforms with chunked approach
-      await _printChunkedWidget(image, printer, paperSize, profile, cutAfterPrinted, chunkSize: chunkSize);
+      await _printChunkedWidget(
+          image, printer, paperSize, profile, cutAfterPrinted,
+          chunkSize: chunkSize);
     } catch (e) {
       throw Exception('Failed to print widget: $e');
     }
@@ -230,10 +244,13 @@ class FlutterThermalPrinter {
 
     for (var i = 0; i < chunksCount; i++) {
       final startY = i * chunkHeight;
-      final endY = (startY + chunkHeight > totalHeight) ? totalHeight : startY + chunkHeight;
+      final endY = (startY + chunkHeight > totalHeight)
+          ? totalHeight
+          : startY + chunkHeight;
       final actualHeight = endY - startY;
 
-      final croppedImage = img.copyCrop(image, x: 0, y: startY, width: totalWidth, height: actualHeight);
+      final croppedImage = img.copyCrop(image,
+          x: 0, y: startY, width: totalWidth, height: actualHeight);
 
       final raster = generator.imageRaster(croppedImage);
       bytes.addAll(raster);
@@ -297,7 +314,9 @@ class FlutterThermalPrinter {
       // Print image in chunks
       for (var i = 0; i < chunksCount; i++) {
         final startY = i * chunkHeight;
-        final endY = (startY + chunkHeight > totalHeight) ? totalHeight : startY + chunkHeight;
+        final endY = (startY + chunkHeight > totalHeight)
+            ? totalHeight
+            : startY + chunkHeight;
         final actualHeight = endY - startY;
 
         final croppedImage = img.copyCrop(
@@ -313,7 +332,8 @@ class FlutterThermalPrinter {
       await printData(printer, raster, longData: true, chunkSize: chunkSize);
 
       if (cutAfterPrinted) {
-        await printData(printer, ticket.cut(), longData: true, chunkSize: chunkSize);
+        await printData(printer, ticket.cut(),
+            longData: true, chunkSize: chunkSize);
       }
     }
   }

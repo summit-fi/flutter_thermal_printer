@@ -213,6 +213,10 @@ class PrinterManager {
     // USB devices don't need explicit disconnection
   }
 
+  /// Requests cancellation of the active native print operation.
+  Future<void> cancelPrint() =>
+      FlutterThermalPrinterPlatform.instance.cancelPrint();
+
   /// Print data to printer device
   Future<bool> printData(Printer printer, List<int> bytes,
       {bool longData = false, int? chunkSize}) async {

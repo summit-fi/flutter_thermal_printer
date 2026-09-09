@@ -10,10 +10,13 @@
 #include <flutter/method_channel.h>
 #include <flutter/plugin_registrar_windows.h>
 
+#include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -37,15 +40,30 @@ class FlutterThermalPrinterPlugin : public flutter::Plugin {
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
 
  private:
-  bool ConnectBluetoothClassic(const std::string& address);
-  bool PrintBluetoothClassic(const std::string& address, const std::vector<uint8_t>& bytes);
+  using CancellationToken = std::shared_ptr<std::atomic_bool>;
+  using PrintOperation = std::function<bool(const CancellationToken&)>;
+
+  bool ConnectBluetoothClassic(const std::string& address, const CancellationToken& cancellation);
+  bool PrintBluetoothClassic(const std::string& address,
+                             const std::vector<uint8_t>& bytes,
+                             const CancellationToken& cancellation);
   bool IsBluetoothClassicConnected(const std::string& address);
   bool DisconnectBluetoothClassic(const std::string& address);
   bool CanOpenUsbPrinter(const std::string& device_path);
-  bool PrintUsbPrinter(const std::string& device_path, const std::vector<uint8_t>& bytes);
+  static bool PrintUsbPrinter(const std::string& device_path,
+                              const std::vector<uint8_t>& bytes,
+                              const CancellationToken& cancellation);
+  void CancelPrint();
+  void StartPrintWorker(
+      PrintOperation operation,
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
 
   std::unordered_map<std::string, SOCKET> bluetooth_sockets_;
   std::mutex bluetooth_sockets_mutex_;
+  std::mutex print_worker_mutex_;
+  std::thread print_worker_;
+  std::shared_ptr<std::atomic_bool> print_worker_done_;
+  CancellationToken print_worker_cancellation_;
 };
 
 }  // namespace flutter_thermal_printer

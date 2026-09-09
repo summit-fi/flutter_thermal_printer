@@ -24,6 +24,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace flutter_thermal_printer {
@@ -35,7 +36,6 @@ using flutter::EncodableMap;
 using flutter::EncodableValue;
 
 constexpr auto kBluetoothConnectTimeout = std::chrono::seconds(10);
-constexpr int kBluetoothWriteTimeoutMs = 10'000;
 constexpr size_t kBluetoothWriteChunkSize = 1'024;
 constexpr DWORD kUsbWriteTimeoutMs = 10'000;
 
@@ -102,21 +102,31 @@ bool BluetoothAddressFromString(const std::string& address, BTH_ADDR* result) {
   }
 }
 
-bool WaitForConnect(SOCKET socket_handle) {
-  fd_set write_set;
-  FD_ZERO(&write_set);
-  FD_SET(socket_handle, &write_set);
+bool WaitForConnect(
+    SOCKET socket_handle,
+    const std::shared_ptr<std::atomic_bool>& cancellation) {
+  const auto deadline = std::chrono::steady_clock::now() + kBluetoothConnectTimeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (cancellation != nullptr && cancellation->load()) return false;
 
-  timeval timeout{};
-  timeout.tv_sec = static_cast<long>(kBluetoothConnectTimeout.count());
-  const auto select_result = select(0, nullptr, &write_set, nullptr, &timeout);
-  if (select_result != 1) return false;
+    fd_set write_set;
+    FD_ZERO(&write_set);
+    FD_SET(socket_handle, &write_set);
 
-  int socket_error = 0;
-  int socket_error_size = sizeof(socket_error);
-  return getsockopt(socket_handle, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&socket_error),
-                    &socket_error_size) == 0 &&
-      socket_error == 0;
+    timeval timeout{};
+    timeout.tv_usec = 100'000;
+    const auto select_result = select(0, nullptr, &write_set, nullptr, &timeout);
+    if (select_result == SOCKET_ERROR) return false;
+    if (select_result == 0) continue;
+
+    int socket_error = 0;
+    int socket_error_size = sizeof(socket_error);
+    return getsockopt(socket_handle, SOL_SOCKET, SO_ERROR,
+                      reinterpret_cast<char*>(&socket_error),
+                      &socket_error_size) == 0 &&
+        socket_error == 0;
+  }
+  return false;
 }
 
 }  // namespace
@@ -146,6 +156,13 @@ FlutterThermalPrinterPlugin::FlutterThermalPrinterPlugin() {
 }
 
 FlutterThermalPrinterPlugin::~FlutterThermalPrinterPlugin() {
+  CancelPrint();
+  {
+    std::lock_guard lock(print_worker_mutex_);
+    if (print_worker_.joinable()) {
+      print_worker_.join();
+    }
+  }
   std::lock_guard lock(bluetooth_sockets_mutex_);
   for (const auto& [address, socket_handle] : bluetooth_sockets_) {
     BluetoothLog(L"disconnect.cleanup address=" + WideFromUtf8(address));
@@ -156,7 +173,53 @@ FlutterThermalPrinterPlugin::~FlutterThermalPrinterPlugin() {
   WSACleanup();
 }
 
-bool FlutterThermalPrinterPlugin::ConnectBluetoothClassic(const std::string& address) {
+void FlutterThermalPrinterPlugin::StartPrintWorker(
+    PrintOperation operation,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  std::lock_guard lock(print_worker_mutex_);
+  if (print_worker_.joinable()) {
+    if (print_worker_done_ == nullptr || !print_worker_done_->load()) {
+      result->Error("PRINT_BUSY", "Another Windows print operation is still running.");
+      return;
+    }
+    print_worker_.join();
+  }
+
+  const auto done = std::make_shared<std::atomic_bool>(false);
+  const auto cancellation = std::make_shared<std::atomic_bool>(false);
+  print_worker_done_ = done;
+  print_worker_cancellation_ = cancellation;
+  print_worker_ = std::thread([
+      operation = std::move(operation), result = std::move(result), done,
+      cancellation]() mutable {
+        bool success = false;
+        try {
+          success = operation(cancellation);
+          if (cancellation->load()) {
+            result->Error("PRINT_CANCELLED", "Windows print operation was cancelled.");
+          } else {
+            result->Success(EncodableValue(success));
+          }
+        } catch (...) {
+          result->Error("PRINT_FAILED", "Windows print operation failed unexpectedly.");
+        }
+        done->store(true);
+      });
+}
+
+void FlutterThermalPrinterPlugin::CancelPrint() {
+  std::shared_ptr<std::atomic_bool> cancellation;
+  {
+    std::lock_guard lock(print_worker_mutex_);
+    cancellation = print_worker_cancellation_;
+  }
+  if (cancellation != nullptr) cancellation->store(true);
+}
+
+bool FlutterThermalPrinterPlugin::ConnectBluetoothClassic(
+    const std::string& address,
+    const CancellationToken& cancellation) {
+  if (cancellation != nullptr && cancellation->load()) return false;
   const auto normalized_address = NormalizeAddress(address);
   BTH_ADDR bluetooth_address = 0;
   if (!BluetoothAddressFromString(address, &bluetooth_address)) {
@@ -217,17 +280,12 @@ bool FlutterThermalPrinterPlugin::ConnectBluetoothClassic(const std::string& add
     closesocket(socket_handle);
     return false;
   }
-  if (connect_result == SOCKET_ERROR && !WaitForConnect(socket_handle)) {
+  if (connect_result == SOCKET_ERROR && !WaitForConnect(socket_handle, cancellation)) {
     BluetoothLog(L"connect.failed reason=timeout_or_socket_error error=" +
                  std::to_wstring(WSAGetLastError()));
     closesocket(socket_handle);
     return false;
   }
-
-  non_blocking = 0;
-  ioctlsocket(socket_handle, FIONBIO, &non_blocking);
-  setsockopt(socket_handle, SOL_SOCKET, SO_SNDTIMEO,
-             reinterpret_cast<const char*>(&kBluetoothWriteTimeoutMs), sizeof(kBluetoothWriteTimeoutMs));
 
   {
     std::lock_guard lock(bluetooth_sockets_mutex_);
@@ -238,7 +296,10 @@ bool FlutterThermalPrinterPlugin::ConnectBluetoothClassic(const std::string& add
 }
 
 bool FlutterThermalPrinterPlugin::PrintBluetoothClassic(
-    const std::string& address, const std::vector<uint8_t>& bytes) {
+    const std::string& address,
+    const std::vector<uint8_t>& bytes,
+    const CancellationToken& cancellation) {
+  if (cancellation != nullptr && cancellation->load()) return false;
   const auto normalized_address = NormalizeAddress(address);
   if (normalized_address.empty()) {
     BluetoothLog(L"print.failed reason=invalid_address");
@@ -248,7 +309,7 @@ bool FlutterThermalPrinterPlugin::PrintBluetoothClassic(
     BluetoothLog(L"print.skipped reason=empty_data address=" + WideFromUtf8(normalized_address));
     return true;
   }
-  if (!ConnectBluetoothClassic(normalized_address)) return false;
+  if (!ConnectBluetoothClassic(normalized_address, cancellation)) return false;
 
   std::lock_guard lock(bluetooth_sockets_mutex_);
   const auto socket_iterator = bluetooth_sockets_.find(normalized_address);
@@ -259,9 +320,32 @@ bool FlutterThermalPrinterPlugin::PrintBluetoothClassic(
   BluetoothLog(L"print.started address=" + WideFromUtf8(normalized_address) +
                L" bytes=" + std::to_wstring(bytes.size()));
   while (offset < bytes.size()) {
+    if (cancellation != nullptr && cancellation->load()) {
+      shutdown(socket_handle, SD_BOTH);
+      closesocket(socket_handle);
+      bluetooth_sockets_.erase(socket_iterator);
+      BluetoothLog(L"print.cancelled address=" + WideFromUtf8(normalized_address));
+      return false;
+    }
     const auto remaining = bytes.size() - offset;
     const auto chunk_size = static_cast<int>(std::min(remaining, kBluetoothWriteChunkSize));
+    fd_set write_set;
+    FD_ZERO(&write_set);
+    FD_SET(socket_handle, &write_set);
+    timeval wait_time{};
+    wait_time.tv_usec = 100'000;
+    const auto writable = select(0, nullptr, &write_set, nullptr, &wait_time);
+    if (writable == SOCKET_ERROR) {
+      BluetoothLog(L"print.failed address=" + WideFromUtf8(normalized_address) +
+                   L" stage=select error=" + std::to_wstring(WSAGetLastError()));
+      shutdown(socket_handle, SD_BOTH);
+      closesocket(socket_handle);
+      bluetooth_sockets_.erase(socket_iterator);
+      return false;
+    }
+    if (writable == 0) continue;
     const int sent = send(socket_handle, reinterpret_cast<const char*>(bytes.data() + offset), chunk_size, 0);
+    if (sent == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) continue;
     if (sent <= 0) {
       BluetoothLog(L"print.failed address=" + WideFromUtf8(normalized_address) +
                    L" offset=" + std::to_wstring(offset) +
@@ -345,7 +429,9 @@ bool FlutterThermalPrinterPlugin::CanOpenUsbPrinter(const std::string& device_pa
 
 bool FlutterThermalPrinterPlugin::PrintUsbPrinter(
     const std::string& device_path,
-    const std::vector<uint8_t>& bytes) {
+    const std::vector<uint8_t>& bytes,
+    const CancellationToken& cancellation) {
+  if (cancellation != nullptr && cancellation->load()) return false;
   if (bytes.empty()) {
     UsbLog(L"print.skipped reason=empty_data");
     return true;
@@ -382,6 +468,11 @@ bool FlutterThermalPrinterPlugin::PrintUsbPrinter(
   bool success = true;
   UsbLog(L"print.started bytes=" + std::to_wstring(bytes.size()));
   while (offset < bytes.size()) {
+    if (cancellation != nullptr && cancellation->load()) {
+      UsbLog(L"print.cancelled offset=" + std::to_wstring(offset));
+      success = false;
+      break;
+    }
     const auto remaining = bytes.size() - offset;
     const auto chunk_size = static_cast<DWORD>(std::min(remaining, kUsbWriteChunkSize));
     OVERLAPPED overlapped{};
@@ -404,9 +495,25 @@ bool FlutterThermalPrinterPlugin::PrintUsbPrinter(
         break;
       }
 
-      const auto wait_result = WaitForSingleObject(completion_event, kUsbWriteTimeoutMs);
+      DWORD wait_result = WAIT_TIMEOUT;
+      const auto deadline = std::chrono::steady_clock::now() +
+          std::chrono::milliseconds(kUsbWriteTimeoutMs);
+      while (std::chrono::steady_clock::now() < deadline) {
+        if (cancellation != nullptr && cancellation->load()) {
+          CancelIoEx(handle, &overlapped);
+          UsbLog(L"print.cancelled offset=" + std::to_wstring(offset));
+          success = false;
+          break;
+        }
+        wait_result = WaitForSingleObject(completion_event, 100);
+        if (wait_result == WAIT_OBJECT_0 || wait_result == WAIT_FAILED) break;
+      }
+      if (success && wait_result == WAIT_TIMEOUT) {
+        CancelIoEx(handle, &overlapped);
+      }
       if (wait_result != WAIT_OBJECT_0 ||
           GetOverlappedResult(handle, &overlapped, &written, FALSE) == FALSE) {
+        if (!success && cancellation != nullptr && cancellation->load()) break;
         const auto completion_error = GetLastError();
         CancelIoEx(handle, &overlapped);
         UsbLog(L"print.failed stage=completion offset=" + std::to_wstring(offset) +
@@ -453,10 +560,19 @@ void FlutterThermalPrinterPlugin::HandleMethodCall(
     }
     result->Success(flutter::EncodableValue(version_stream.str()));
   } else if (method_call.method_name().compare("connect") == 0 && is_bluetooth_classic) {
-    result->Success(EncodableValue(ConnectBluetoothClassic(StringValue(*arguments, "address"))));
+    result->Success(EncodableValue(
+        ConnectBluetoothClassic(StringValue(*arguments, "address"), nullptr)));
   } else if (method_call.method_name().compare("printText") == 0 && is_bluetooth_classic) {
-    result->Success(EncodableValue(PrintBluetoothClassic(
-        StringValue(*arguments, "address"), BytesValue(*arguments, "data"))));
+    const auto address = StringValue(*arguments, "address");
+    const auto bytes = BytesValue(*arguments, "data");
+    StartPrintWorker(
+        [this, address, bytes](const CancellationToken& cancellation) {
+          return PrintBluetoothClassic(address, bytes, cancellation);
+        },
+        std::move(result));
+  } else if (method_call.method_name().compare("cancelPrint") == 0) {
+    CancelPrint();
+    result->Success();
   } else if (method_call.method_name().compare("isConnected") == 0 && is_bluetooth_classic) {
     result->Success(EncodableValue(IsBluetoothClassicConnected(StringValue(*arguments, "address"))));
   } else if (method_call.method_name().compare("disconnect") == 0 && is_bluetooth_classic) {
@@ -464,8 +580,13 @@ void FlutterThermalPrinterPlugin::HandleMethodCall(
   } else if (method_call.method_name().compare("connect") == 0 && is_usb) {
     result->Success(EncodableValue(CanOpenUsbPrinter(StringValue(*arguments, "address"))));
   } else if (method_call.method_name().compare("printText") == 0 && is_usb) {
-    result->Success(EncodableValue(PrintUsbPrinter(
-        StringValue(*arguments, "address"), BytesValue(*arguments, "data"))));
+    const auto device_path = StringValue(*arguments, "address");
+    const auto bytes = BytesValue(*arguments, "data");
+    StartPrintWorker(
+        [device_path, bytes](const CancellationToken& cancellation) {
+          return PrintUsbPrinter(device_path, bytes, cancellation);
+        },
+        std::move(result));
   } else if (method_call.method_name().compare("isConnected") == 0 && is_usb) {
     result->Success(EncodableValue(CanOpenUsbPrinter(StringValue(*arguments, "address"))));
   } else if (method_call.method_name().compare("disconnect") == 0 && is_usb) {
