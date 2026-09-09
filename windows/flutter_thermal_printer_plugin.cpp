@@ -39,18 +39,22 @@ constexpr auto kBluetoothConnectTimeout = std::chrono::seconds(10);
 constexpr size_t kBluetoothWriteChunkSize = 1'024;
 constexpr DWORD kUsbWriteTimeoutMs = 10'000;
 
+/// Writes diagnostic messages to the Windows debugger output.
 void BluetoothLog(const std::wstring& message) {
   OutputDebugStringW((L"[FlutterThermalPrinterNative] windows.bluetooth " + message + L"\n").c_str());
 }
 
+/// Writes USB transport diagnostics to the Windows debugger output.
 void UsbLog(const std::wstring& message) {
   OutputDebugStringW((L"[FlutterThermalPrinterNative] windows.usb " + message + L"\n").c_str());
 }
 
+/// Writes print lifecycle diagnostics to the Windows debugger output.
 void PrintLog(const std::wstring& message) {
   OutputDebugStringW((L"[FlutterThermalPrinterNative] windows.print " + message + L"\n").c_str());
 }
 
+/// Converts UTF-8 input received from Dart to a Windows string.
 std::wstring WideFromUtf8(const std::string& value) {
   if (value.empty()) return L"";
   const int size = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, nullptr, 0);
@@ -61,6 +65,7 @@ std::wstring WideFromUtf8(const std::string& value) {
   return result;
 }
 
+/// Reads a string argument from a Flutter method-call map.
 std::string StringValue(const EncodableMap& map, const char* key) {
   const auto iterator = map.find(EncodableValue(key));
   if (iterator == map.end()) return "";
@@ -68,6 +73,7 @@ std::string StringValue(const EncodableMap& map, const char* key) {
   return value == nullptr ? "" : *value;
 }
 
+/// Reads a byte list argument from a Flutter method-call map.
 std::vector<uint8_t> BytesValue(const EncodableMap& map, const char* key) {
   const auto iterator = map.find(EncodableValue(key));
   if (iterator == map.end()) return {};
@@ -86,6 +92,7 @@ std::vector<uint8_t> BytesValue(const EncodableMap& map, const char* key) {
   return bytes;
 }
 
+/// Removes separators and validates a Bluetooth address for Win32 APIs.
 std::string NormalizeAddress(const std::string& address) {
   std::string normalized;
   normalized.reserve(12);
@@ -95,6 +102,7 @@ std::string NormalizeAddress(const std::string& address) {
   return normalized.size() == 12 ? normalized : "";
 }
 
+/// Parses a normalized Bluetooth address into the Win32 address representation.
 bool BluetoothAddressFromString(const std::string& address, BTH_ADDR* result) {
   const auto normalized = NormalizeAddress(address);
   if (normalized.empty() || result == nullptr) return false;
@@ -106,6 +114,7 @@ bool BluetoothAddressFromString(const std::string& address, BTH_ADDR* result) {
   }
 }
 
+/// Waits for a non-blocking RFCOMM connect without blocking the worker indefinitely.
 bool WaitForConnect(
     SOCKET socket_handle,
     const std::shared_ptr<std::atomic_bool>& cancellation) {
@@ -135,7 +144,6 @@ bool WaitForConnect(
 
 }  // namespace
 
-// static
 void FlutterThermalPrinterPlugin::RegisterWithRegistrar(
     flutter::PluginRegistrarWindows *registrar) {
   auto channel =
