@@ -7,7 +7,8 @@ import 'dart:io';
 import 'package:flutter/services.dart';
 import 'package:universal_ble/universal_ble.dart';
 
-import 'Windows/windows_platform.dart' if (dart.library.html) 'Windows/windows_stub.dart';
+import 'Windows/windows_platform.dart'
+    if (dart.library.html) 'Windows/windows_stub.dart';
 import 'flutter_thermal_printer_platform_interface.dart';
 import 'network/network_printer.dart';
 import 'utils/ble_config.dart';
@@ -29,7 +30,8 @@ class PrinterManager {
 
   BleConfig bleConfig = const BleConfig();
 
-  final StreamController<List<Printer>> _devicesStream = StreamController<List<Printer>>.broadcast();
+  final StreamController<List<Printer>> _devicesStream =
+      StreamController<List<Printer>>.broadcast();
 
   Stream<List<Printer>> get devicesStream => _devicesStream.stream;
 
@@ -95,7 +97,8 @@ class PrinterManager {
   /// [device] The printer device to connect to.
   /// [connectionStabilizationDelay] Optional delay to wait after connection is established
   /// before considering it stable. Defaults to [BleConfig.connectionStabilizationDelay].
-  Future<bool> connect(Printer device, {Duration? connectionStabilizationDelay}) async {
+  Future<bool> connect(Printer device,
+      {Duration? connectionStabilizationDelay}) async {
     if (device.connectionType == ConnectionType.USB) {
       if (Platform.isWindows && !_usesWindowsUsbDevicePath(device)) return true;
       return FlutterThermalPrinterPlatform.instance.connect(device);
@@ -133,7 +136,8 @@ class PrinterManager {
           });
 
           await device.connect();
-          final delay = connectionStabilizationDelay ?? bleConfig.connectionStabilizationDelay;
+          final delay = connectionStabilizationDelay ??
+              bleConfig.connectionStabilizationDelay;
           final connected = await connectionCompleter.future.timeout(
             delay,
             onTimeout: () {
@@ -141,7 +145,8 @@ class PrinterManager {
               return false;
             },
           );
-          _updateBleConnectionState(address, connected, fallbackName: device.name);
+          _updateBleConnectionState(address, connected,
+              fallbackName: device.name);
           return connected;
         } catch (e) {
           log('Error connecting to device: $e');
@@ -191,7 +196,8 @@ class PrinterManager {
       try {
         if (device.address != null) {
           await device.disconnect();
-          _updateBleConnectionState(device.address!, false, fallbackName: device.name);
+          _updateBleConnectionState(device.address!, false,
+              fallbackName: device.name);
           log('Disconnected from device ${device.name}');
         }
       } catch (e) {
@@ -208,7 +214,8 @@ class PrinterManager {
   }
 
   /// Print data to printer device
-  Future<bool> printData(Printer printer, List<int> bytes, {bool longData = false, int? chunkSize}) async {
+  Future<bool> printData(Printer printer, List<int> bytes,
+      {bool longData = false, int? chunkSize}) async {
     if (printer.connectionType == ConnectionType.USB) {
       if (Platform.isWindows) {
         if (_usesWindowsUsbDevicePath(printer)) {
@@ -224,10 +231,9 @@ class PrinterManager {
           }
         }
 
-        using((alloc) {
-          RawPrinter(printer.name!, alloc).printEscPosWin32(bytes);
-        });
-        return true;
+        return using(
+          (alloc) => RawPrinter(printer.name!, alloc).printEscPosWin32(bytes),
+        );
       } else {
         // Non-Windows USB printing
         try {
@@ -242,7 +248,8 @@ class PrinterManager {
         }
       }
     } else if (printer.connectionType == ConnectionType.BLUETOOTH_CLASSIC) {
-      return FlutterThermalPrinterPlatform.instance.printText(printer, Uint8List.fromList(bytes));
+      return FlutterThermalPrinterPlatform.instance
+          .printText(printer, Uint8List.fromList(bytes));
     } else if (printer.connectionType == ConnectionType.BLE) {
       try {
         final services = await printer.discoverServices();
@@ -270,15 +277,19 @@ class PrinterManager {
           log('No write characteristic found');
           return false;
         }
-        final mtu =
-            chunkSize ??
+        final mtu = chunkSize ??
             (Platform.isWindows
                 ? 50
-                : await printer.requestMtu(Platform.isMacOS || Platform.isLinux ? 150 : 500));
+                : await printer.requestMtu(
+                    Platform.isMacOS || Platform.isLinux ? 150 : 500));
         final maxChunkSize = mtu - 3;
 
         for (var i = 0; i < bytes.length; i += maxChunkSize) {
-          final chunk = bytes.sublist(i, i + maxChunkSize > bytes.length ? bytes.length : i + maxChunkSize);
+          final chunk = bytes.sublist(
+              i,
+              i + maxChunkSize > bytes.length
+                  ? bytes.length
+                  : i + maxChunkSize);
 
           await writeCharacteristic.write(Uint8List.fromList(chunk));
 
@@ -323,7 +334,10 @@ class PrinterManager {
   /// Get Printers from BT and USB
   Future<void> getPrinters({
     Duration refreshDuration = const Duration(seconds: 2),
-    List<ConnectionType> connectionTypes = const [ConnectionType.BLE, ConnectionType.USB],
+    List<ConnectionType> connectionTypes = const [
+      ConnectionType.BLE,
+      ConnectionType.USB
+    ],
     bool androidUsesFineLocation = false,
   }) async {
     if (connectionTypes.isEmpty) {
@@ -345,7 +359,8 @@ class PrinterManager {
       if (Platform.isWindows) {
         // Windows USB printer discovery using Win32 API
         await _usbSubscription?.cancel();
-        _usbSubscription = Stream.periodic(refreshDuration, (x) => x).listen((event) async {
+        _usbSubscription =
+            Stream.periodic(refreshDuration, (x) => x).listen((event) async {
           final devices = PrinterNames(PRINTER_ENUM_LOCAL);
           final tempList = <Printer>[];
 
@@ -369,7 +384,8 @@ class PrinterManager {
         });
       } else {
         // Non-Windows USB printer discovery
-        final devices = await FlutterThermalPrinterPlatform.instance.startUsbScan();
+        final devices =
+            await FlutterThermalPrinterPlatform.instance.startUsbScan();
 
         final usbPrinters = <Printer>[];
         for (final map in devices) {
@@ -381,7 +397,8 @@ class PrinterManager {
             address: map['vendorId'].toString(),
             isConnected: false,
           );
-          final isConnected = await FlutterThermalPrinterPlatform.instance.isConnected(printer);
+          final isConnected =
+              await FlutterThermalPrinterPlatform.instance.isConnected(printer);
           usbPrinters.add(printer.copyWith(isConnected: isConnected));
         }
 
@@ -390,7 +407,8 @@ class PrinterManager {
         }
         if (Platform.isAndroid) {
           await _usbSubscription?.cancel();
-          _usbSubscription = _eventChannel.receiveBroadcastStream().listen((event) {
+          _usbSubscription =
+              _eventChannel.receiveBroadcastStream().listen((event) {
             final map = Map<String, dynamic>.from(event);
             _updateOrAddPrinter(
               Printer(
@@ -405,8 +423,10 @@ class PrinterManager {
           });
         } else {
           await _usbSubscription?.cancel();
-          _usbSubscription = Stream.periodic(refreshDuration, (x) => x).listen((event) async {
-            final devices = await FlutterThermalPrinterPlatform.instance.startUsbScan();
+          _usbSubscription =
+              Stream.periodic(refreshDuration, (x) => x).listen((event) async {
+            final devices =
+                await FlutterThermalPrinterPlatform.instance.startUsbScan();
 
             final usbPrinters = <Printer>[];
             for (final map in devices) {
@@ -418,7 +438,8 @@ class PrinterManager {
                 address: map['vendorId'].toString(),
                 isConnected: false,
               );
-              final isConnected = await FlutterThermalPrinterPlatform.instance.isConnected(printer);
+              final isConnected = await FlutterThermalPrinterPlatform.instance
+                  .isConnected(printer);
               usbPrinters.add(printer.copyWith(isConnected: isConnected));
             }
 
@@ -461,7 +482,8 @@ class PrinterManager {
       // Start scanning
       await UniversalBle.startScan(
         platformConfig: PlatformConfig(
-          android: AndroidOptions(requestLocationPermission: androidUsesFineLocation),
+          android: AndroidOptions(
+              requestLocationPermission: androidUsesFineLocation),
         ),
       );
       log('Started BLE scan');
@@ -472,7 +494,8 @@ class PrinterManager {
       _bleSubscription = UniversalBle.scanStream.listen(
         (scanResult) async {
           if (scanResult.name?.isNotEmpty ?? false) {
-            final isConnected = await _isBleDeviceConnected(scanResult.deviceId);
+            final isConnected =
+                await _isBleDeviceConnected(scanResult.deviceId);
             _updateOrAddPrinter(
               Printer(
                 address: scanResult.deviceId,
@@ -495,22 +518,27 @@ class PrinterManager {
   /// Update or add printer to the devices list
   void _updateOrAddPrinter(Printer printer) {
     final index = _devices.indexWhere(
-      (device) => device.connectionType == printer.connectionType && device.address == printer.address,
+      (device) =>
+          device.connectionType == printer.connectionType &&
+          device.address == printer.address,
     );
     if (index == -1) {
       _devices.add(printer);
     } else {
       _devices[index] = printer;
     }
-    if (printer.connectionType == ConnectionType.BLE && (printer.address?.isNotEmpty ?? false)) {
-      _ensureBleConnectionListener(printer.address!, fallbackName: printer.name);
+    if (printer.connectionType == ConnectionType.BLE &&
+        (printer.address?.isNotEmpty ?? false)) {
+      _ensureBleConnectionListener(printer.address!,
+          fallbackName: printer.name);
     }
     sortDevices();
   }
 
   Future<bool> _isBleDeviceConnected(String deviceId) async {
     try {
-      return await UniversalBle.getConnectionState(deviceId) == BleConnectionState.connected;
+      return await UniversalBle.getConnectionState(deviceId) ==
+          BleConnectionState.connected;
     } catch (e) {
       log('Failed to fetch BLE state for $deviceId: $e');
       return false;
@@ -557,7 +585,9 @@ class PrinterManager {
   Future<void> _syncKnownBleConnectionStates() async {
     final bleDevices = _devices
         .where(
-          (device) => device.connectionType == ConnectionType.BLE && (device.address?.isNotEmpty ?? false),
+          (device) =>
+              device.connectionType == ConnectionType.BLE &&
+              (device.address?.isNotEmpty ?? false),
         )
         .toList(growable: false);
 
@@ -591,9 +621,11 @@ class PrinterManager {
     if (_bleConnectionSubscriptions.containsKey(deviceId)) {
       return;
     }
-    _bleConnectionSubscriptions[deviceId] = UniversalBle.connectionStream(deviceId).listen(
+    _bleConnectionSubscriptions[deviceId] =
+        UniversalBle.connectionStream(deviceId).listen(
       (isConnected) {
-        _updateBleConnectionState(deviceId, isConnected, fallbackName: fallbackName);
+        _updateBleConnectionState(deviceId, isConnected,
+            fallbackName: fallbackName);
       },
       onError: (error) {
         log('BLE connection stream error for $deviceId: $error');
@@ -601,9 +633,12 @@ class PrinterManager {
     );
   }
 
-  void _updateBleConnectionState(String deviceId, bool isConnected, {String? fallbackName}) {
+  void _updateBleConnectionState(String deviceId, bool isConnected,
+      {String? fallbackName}) {
     final index = _devices.indexWhere(
-      (device) => device.connectionType == ConnectionType.BLE && device.address == deviceId,
+      (device) =>
+          device.connectionType == ConnectionType.BLE &&
+          device.address == deviceId,
     );
 
     if (index == -1) {
@@ -620,13 +655,16 @@ class PrinterManager {
 
     final current = _devices[index];
     final normalizedFallbackName = _normalizeDeviceName(fallbackName);
-    final resolvedName = _normalizeDeviceName(current.name) ?? normalizedFallbackName ?? current.name;
+    final resolvedName = _normalizeDeviceName(current.name) ??
+        normalizedFallbackName ??
+        current.name;
 
     if (current.isConnected == isConnected && current.name == resolvedName) {
       return;
     }
 
-    _devices[index] = current.copyWith(isConnected: isConnected, name: resolvedName);
+    _devices[index] =
+        current.copyWith(isConnected: isConnected, name: resolvedName);
     sortDevices();
   }
 
@@ -640,7 +678,8 @@ class PrinterManager {
 
   /// Sort and filter devices
   void sortDevices() {
-    _devices.removeWhere((element) => element.name == null || element.name == '');
+    _devices
+        .removeWhere((element) => element.name == null || element.name == '');
     // remove items having same vendorId
     final seen = <String>{};
     _devices.retainWhere((element) {
@@ -669,10 +708,11 @@ class PrinterManager {
   }
 
   /// Stream to monitor Bluetooth state
-  Stream<bool> get isBleTurnedOnStream => Stream.periodic(const Duration(seconds: 5), (_) async {
-    final state = await UniversalBle.getBluetoothAvailabilityState();
-    return state == AvailabilityState.poweredOn;
-  }).asyncMap((event) => event).distinct();
+  Stream<bool> get isBleTurnedOnStream =>
+      Stream.periodic(const Duration(seconds: 5), (_) async {
+        final state = await UniversalBle.getBluetoothAvailabilityState();
+        return state == AvailabilityState.poweredOn;
+      }).asyncMap((event) => event).distinct();
 
   /// Check if Bluetooth is turned on
   Future<bool> isBleTurnedOn() async {

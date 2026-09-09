@@ -14,7 +14,7 @@ class RawPrinter {
   final String printerName;
   final Arena alloc;
 
-  void printEscPosWin32(List<int> data) {
+  bool printEscPosWin32(List<int> data) {
     final hPrinter = calloc<Pointer>();
     final docInfo = calloc<DOC_INFO_1>();
 
@@ -29,30 +29,34 @@ class RawPrinter {
     docInfo.ref.pOutputFile = PWSTR(nullptr);
     docInfo.ref.pDatatype = PWSTR(dataTypePtr);
 
+    var success = false;
     if (OpenPrinter(PCWSTR(printerNamePtr), hPrinter, null).value) {
       final printerHandle = PRINTER_HANDLE(hPrinter.value);
 
       if (StartDocPrinter(printerHandle, 1, docInfo) != 0) {
-        StartPagePrinter(printerHandle);
+        final pageStarted = StartPagePrinter(printerHandle);
 
         final buffer = Uint8List.fromList(data);
         final bytesWritten = calloc<DWORD>();
         final nativeBuffer = calloc<Uint8>(buffer.length);
         nativeBuffer.asTypedList(buffer.length).setAll(0, buffer);
 
-        WritePrinter(
-          printerHandle,
-          nativeBuffer,
-          buffer.length,
-          bytesWritten,
-        );
+        final writeStarted = pageStarted &&
+            WritePrinter(
+              printerHandle,
+              nativeBuffer,
+              buffer.length,
+              bytesWritten,
+            ) &&
+            bytesWritten.value == buffer.length;
 
         calloc
           ..free(nativeBuffer)
           ..free(bytesWritten);
 
-        EndPagePrinter(printerHandle);
-        EndDocPrinter(printerHandle);
+        final pageEnded = pageStarted && EndPagePrinter(printerHandle);
+        final documentEnded = EndDocPrinter(printerHandle);
+        success = writeStarted && pageEnded && documentEnded;
       }
 
       ClosePrinter(printerHandle);
@@ -64,5 +68,7 @@ class RawPrinter {
       ..free(dataTypePtr)
       ..free(hPrinter)
       ..free(docInfo);
+
+    return success;
   }
 }
