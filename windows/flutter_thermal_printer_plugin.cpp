@@ -886,7 +886,7 @@ void FlutterThermalPrinterPlugin::HandleMethodCall(
       return;
     }
     StartConnectionWorker(
-        [device_path](const CancellationToken&) {
+        [this, device_path](const CancellationToken&) {
           return CanOpenUsbPrinter(device_path);
         },
         "usb",
