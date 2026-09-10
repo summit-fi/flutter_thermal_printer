@@ -4,6 +4,9 @@ import IOKit.usb
 import IOKit.usb.IOUSBLib
 
 final class MacOSUsbPrinterTransport {
+  private static let operationTimeoutNanoseconds: UInt64 = 30 * 1_000_000_000
+  private static let pipeTimeoutMilliseconds: UInt32 = 10_000
+
   func canOpen(address: String) -> Bool {
     perform(address: address, data: nil)
   }
@@ -126,7 +129,7 @@ final class MacOSUsbPrinterTransport {
   }
 
   private func log(_ message: String) {
-    NSLog("[FlutterThermalPrinterNative] macos.usb \(message)")
+    NSLog("[FlutterThermalPrinterNative] platform=macos transport=usb \(message)")
   }
 }
 
@@ -238,16 +241,33 @@ private final class OpenUsbPrinterInterface {
 
     let chunkSize = 4_096
     var offset = 0
+    let startedAt = DispatchTime.now().uptimeNanoseconds
     while offset < data.count {
+      let elapsed = DispatchTime.now().uptimeNanoseconds - startedAt
+      guard elapsed < Self.operationTimeoutNanoseconds else {
+        NSLog("[FlutterThermalPrinterNative] macos.usb write.timeout bytes=\(data.count) offset=\(offset)")
+        return false
+      }
+
       let length = min(chunkSize, data.count - offset)
+      let remainingMilliseconds = UInt32(
+        min(
+          UInt64(Self.pipeTimeoutMilliseconds),
+          (Self.operationTimeoutNanoseconds - elapsed) / 1_000_000
+        )
+      )
+      guard remainingMilliseconds > 0 else {
+        NSLog("[FlutterThermalPrinterNative] macos.usb write.timeout bytes=\(data.count) offset=\(offset)")
+        return false
+      }
       let result = data.withUnsafeBytes { buffer in
         interface.WritePipeTO(
           interfacePointer,
           pipe,
           UnsafeMutableRawPointer(mutating: buffer.baseAddress!.advanced(by: offset)),
           UInt32(length),
-          10_000,
-          10_000
+          remainingMilliseconds,
+          remainingMilliseconds
         )
       }
       guard result == KERN_SUCCESS else {

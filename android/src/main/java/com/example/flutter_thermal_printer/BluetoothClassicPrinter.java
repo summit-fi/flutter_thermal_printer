@@ -16,13 +16,20 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 public class BluetoothClassicPrinter {
     private static final String TAG = "FPP";
     private static final UUID SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
+    private static final long OPERATION_TIMEOUT_MS = 30_000L;
 
     private final Context context;
     private final Map<String, BluetoothSocket> sockets = new HashMap<>();
+    private final ScheduledExecutorService timeoutExecutor = Executors.newSingleThreadScheduledExecutor();
+    private volatile BluetoothSocket activeSocket;
 
     BluetoothClassicPrinter(Context context) {
         this.context = context.getApplicationContext();
@@ -60,9 +67,10 @@ public class BluetoothClassicPrinter {
 
             adapter.cancelDiscovery();
 
-            BluetoothSocket socket = connectSocket(device, false);
-            if (socket == null) {
-                socket = connectSocket(device, true);
+            long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(OPERATION_TIMEOUT_MS);
+            BluetoothSocket socket = connectSocket(device, false, remainingMillis(deadline));
+            if (socket == null && remainingMillis(deadline) > 0) {
+                socket = connectSocket(device, true, remainingMillis(deadline));
             }
             if (socket == null) {
                 Log.d(TAG, "Cannot connect Bluetooth Classic printer. RFCOMM socket failed: " + address);
@@ -95,6 +103,7 @@ public class BluetoothClassicPrinter {
             return false;
         }
 
+        ScheduledFuture<?> timeout = scheduleSocketClose(socket, OPERATION_TIMEOUT_MS, "print");
         try {
             OutputStream outputStream = socket.getOutputStream();
             byte[] data = new byte[bytes.size()];
@@ -108,6 +117,8 @@ public class BluetoothClassicPrinter {
             Log.d(TAG, "Bluetooth Classic print failed: " + error);
             disconnect(address);
             return false;
+        } finally {
+            cancelTimeout(timeout);
         }
     }
 
@@ -125,20 +136,60 @@ public class BluetoothClassicPrinter {
         return true;
     }
 
+    public void cancelActiveOperation() {
+        closeQuietly(activeSocket);
+    }
+
+    public void closeAll() {
+        closeQuietly(activeSocket);
+        synchronized (this) {
+            for (BluetoothSocket socket : sockets.values()) {
+                closeQuietly(socket);
+            }
+            sockets.clear();
+        }
+        timeoutExecutor.shutdownNow();
+    }
+
     @SuppressLint("MissingPermission")
-    private BluetoothSocket connectSocket(BluetoothDevice device, boolean insecure) {
+    private BluetoothSocket connectSocket(BluetoothDevice device, boolean insecure, long timeoutMs) {
         BluetoothSocket socket = null;
+        if (timeoutMs <= 0) return null;
+        ScheduledFuture<?> timeout = null;
         try {
             socket = insecure
                     ? device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
                     : device.createRfcommSocketToServiceRecord(SPP_UUID);
+            activeSocket = socket;
+            timeout = scheduleSocketClose(socket, timeoutMs, insecure ? "connect_insecure" : "connect_secure");
             socket.connect();
             return socket;
         } catch (IOException error) {
             Log.d(TAG, "Bluetooth Classic " + (insecure ? "insecure" : "secure") + " socket failed: " + error);
             closeQuietly(socket);
             return null;
+        } finally {
+            cancelTimeout(timeout);
+            if (activeSocket == socket) activeSocket = null;
         }
+    }
+
+    private long remainingMillis(long deadline) {
+        return Math.max(0L, TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()));
+    }
+
+    private ScheduledFuture<?> scheduleSocketClose(
+            BluetoothSocket socket,
+            long timeoutMs,
+            String operation) {
+        return timeoutExecutor.schedule(() -> {
+            Log.d(TAG, "Bluetooth Classic operation timed out: " + operation);
+            closeQuietly(socket);
+        }, timeoutMs, TimeUnit.MILLISECONDS);
+    }
+
+    private void cancelTimeout(ScheduledFuture<?> timeout) {
+        if (timeout != null) timeout.cancel(false);
     }
 
     private boolean hasBluetoothConnectPermission() {

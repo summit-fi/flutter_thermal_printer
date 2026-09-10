@@ -2,6 +2,8 @@ import Foundation
 import IOBluetooth
 
 final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMChannelDelegate {
+  private static let writeTimeout: TimeInterval = 30
+  private static let connectionTimeout: TimeInterval = 30
   private var channelsByAddress = [String: IOBluetoothRFCOMMChannel]()
   private var pendingConnections = [String: MacOSBluetoothSdpQuery]()
   // Keep cancelled queries alive until IOBluetooth finishes its native
@@ -57,8 +59,8 @@ final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMCh
       }
     )
     pendingConnections[normalizedAddress] = query
-    query.start()
-    log("sdp.started address=\(normalizedAddress)")
+    query.start(timeout: Self.connectionTimeout)
+    log("sdp.started address=\(normalizedAddress) timeoutSeconds=\(Int(Self.connectionTimeout))")
   }
 
   func isConnected(address: String) -> Bool {
@@ -71,6 +73,11 @@ final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMCh
     if let query = pendingConnections.removeValue(forKey: normalizedAddress) {
       cancelledConnections[query.id] = query
       query.cancel()
+    }
+    if let pending = pendingWrites.removeValue(forKey: normalizedAddress) {
+      pending.timeoutWorkItem?.cancel()
+      log("write.cancelled address=\(normalizedAddress) id=\(pending.id.uuidString) reason=disconnect")
+      pending.completion(.failure(MacOSBluetoothTransportError.writeCancelled))
     }
     guard let channel = channelsByAddress.removeValue(forKey: normalizedAddress) else { return }
     let status = channel.close()
@@ -93,13 +100,30 @@ final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMCh
         return
       }
       let mtu = max(1, Int(channel.getMTU()))
+      let writeID = UUID()
       self.log("write.started address=\(normalizedAddress) bytes=\(data.count) mtu=\(mtu)")
       self.pendingWrites[normalizedAddress] = PendingWrite(
+        id: writeID,
         nsData: data as NSData,
         chunkSize: min(mtu, 512),
         offset: 0,
-        completion: completion
+        completion: completion,
+        timeoutWorkItem: nil
       )
+      let timeoutWorkItem = DispatchWorkItem { [weak self] in
+        guard let self,
+              let pending = self.pendingWrites[normalizedAddress],
+              pending.id == writeID
+        else { return }
+        self.pendingWrites.removeValue(forKey: normalizedAddress)
+        if let channel = self.channelsByAddress.removeValue(forKey: normalizedAddress) {
+          _ = channel.close()
+        }
+        self.log("write.timeout address=\(normalizedAddress) id=\(writeID.uuidString)")
+        pending.completion(.failure(MacOSBluetoothTransportError.writeTimeout))
+      }
+      self.pendingWrites[normalizedAddress]?.timeoutWorkItem = timeoutWorkItem
+      DispatchQueue.main.asyncAfter(deadline: .now() + Self.writeTimeout, execute: timeoutWorkItem)
       self.sendNextChunk(address: normalizedAddress, channel: channel)
     }
   }
@@ -111,7 +135,8 @@ final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMCh
 
     if pending.offset >= pending.totalBytes {
       pendingWrites.removeValue(forKey: address)
-      log("write.completed address=\(address) bytes=\(pending.totalBytes)")
+      pending.timeoutWorkItem?.cancel()
+      log("write.completed address=\(address) id=\(pending.id.uuidString) bytes=\(pending.totalBytes)")
       pending.completion(.success(()))
       return
     }
@@ -122,7 +147,8 @@ final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMCh
 
     if status != kIOReturnSuccess {
       let failed = pendingWrites.removeValue(forKey: address)
-      log("write.failed address=\(address) offset=\(pending.offset) status=\(status)")
+      failed?.timeoutWorkItem?.cancel()
+      log("write.failed address=\(address) id=\(failed?.id.uuidString ?? "unknown") offset=\(pending.offset) status=\(status)")
       failed?.completion(.failure(MacOSBluetoothTransportError.writeFailed(status)))
       return
     }
@@ -171,7 +197,8 @@ final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMCh
 
       if status != kIOReturnSuccess {
         if let failed = self.pendingWrites.removeValue(forKey: address) {
-          self.log("write.failed address=\(address) status=\(status)")
+          failed.timeoutWorkItem?.cancel()
+          self.log("write.failed address=\(address) id=\(failed.id.uuidString) status=\(status)")
           failed.completion(.failure(MacOSBluetoothTransportError.writeFailed(status)))
         }
         return
@@ -185,7 +212,8 @@ final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMCh
     guard let entry = channelsByAddress.first(where: { $0.value === rfcommChannel }) else { return }
     channelsByAddress.removeValue(forKey: entry.key)
     if let failed = pendingWrites.removeValue(forKey: entry.key) {
-      log("channel.closed address=\(entry.key) channel=\(rfcommChannel.getID()) write_interrupted=true")
+      failed.timeoutWorkItem?.cancel()
+      log("channel.closed address=\(entry.key) id=\(failed.id.uuidString) channel=\(rfcommChannel.getID()) write_interrupted=true")
       failed.completion(.failure(MacOSBluetoothTransportError.channelUnavailable(entry.key)))
     } else {
       log("channel.closed address=\(entry.key) channel=\(rfcommChannel.getID())")
@@ -197,15 +225,17 @@ final class MacOSBluetoothClassicPrinterTransport: NSObject, IOBluetoothRFCOMMCh
   }
 
   private func log(_ message: String) {
-    NSLog("[FlutterThermalPrinterNative] macos.bluetooth \(message)")
+    NSLog("[FlutterThermalPrinterNative] platform=macos transport=bluetoothClassic \(message)")
   }
 }
 
 private struct PendingWrite {
+  let id: UUID
   let nsData: NSData
   let chunkSize: Int
   var offset: Int
   let completion: (Result<Void, Error>) -> Void
+  var timeoutWorkItem: DispatchWorkItem?
   var totalBytes: Int { nsData.length }
 }
 
@@ -216,6 +246,7 @@ private final class MacOSBluetoothSdpQuery: NSObject {
   private let onNativeOperationFinished: () -> Void
   private var completed = false
   private var cancelled = false
+  private var timeoutWorkItem: DispatchWorkItem?
 
   init(
     id: UUID,
@@ -229,7 +260,14 @@ private final class MacOSBluetoothSdpQuery: NSObject {
     self.onNativeOperationFinished = onNativeOperationFinished
   }
 
-  func start() {
+  func start(timeout: TimeInterval) {
+    timeoutWorkItem = DispatchWorkItem { [weak self] in
+      self?.timeout()
+    }
+    if let timeoutWorkItem {
+      DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: timeoutWorkItem)
+    }
+
     if device.isConnected() {
       beginSdpQuery()
       return
@@ -266,16 +304,30 @@ private final class MacOSBluetoothSdpQuery: NSObject {
   }
 
   func cancel() {
-    guard !cancelled else { return }
+    finishCancellation(
+      error: MacOSBluetoothTransportError.connectionCancelled,
+      reason: "cancelled"
+    )
+  }
+
+  private func timeout() {
+    finishCancellation(
+      error: MacOSBluetoothTransportError.connectionTimeout,
+      reason: "timeout"
+    )
+  }
+
+  private func finishCancellation(error: Error, reason: String) {
+    guard !cancelled, !completed else { return }
     cancelled = true
     // Abort the native baseband/SDP operation. The transport retains this
     // query until the late native callback arrives.
     _ = device.closeConnection()
     NSLog(
       "[FlutterThermalPrinterNative] macos.bluetooth query.cancelled " +
-        "address=\(device.addressString ?? "unknown")"
+        "address=\(device.addressString ?? "unknown") reason=\(reason)"
     )
-    complete(.failure(MacOSBluetoothTransportError.connectionCancelled))
+    complete(.failure(error))
   }
 
   @objc(sdpQueryComplete:status:)
@@ -312,6 +364,8 @@ private final class MacOSBluetoothSdpQuery: NSObject {
   private func complete(_ result: Result<BluetoothRFCOMMChannelID, Error>) {
     guard !completed else { return }
     completed = true
+    timeoutWorkItem?.cancel()
+    timeoutWorkItem = nil
     onCompleted(result)
   }
 }
@@ -324,10 +378,13 @@ private enum MacOSBluetoothTransportError: LocalizedError {
   case basebandConnectionFailed(IOReturn)
   case sdpStartFailed(IOReturn)
   case sdpQueryFailed(IOReturn)
+  case connectionTimeout
   case serialPortProfileUnavailable
   case channelOpenFailed(IOReturn)
   case channelUnavailable(String)
   case writeFailed(IOReturn)
+  case writeTimeout
+  case writeCancelled
   case writeAlreadyInProgress
   case connectionCancelled
 
@@ -355,10 +412,16 @@ private enum MacOSBluetoothTransportError: LocalizedError {
       return "Bluetooth printer \(address) is not connected."
     case .writeFailed(let status):
       return "Unable to send data to the Bluetooth printer: \(status)."
+    case .writeTimeout:
+      return "Bluetooth printer write timed out."
+    case .writeCancelled:
+      return "Bluetooth printer write was cancelled."
     case .writeAlreadyInProgress:
       return "A Bluetooth write operation is already in progress."
     case .connectionCancelled:
       return "Bluetooth connection was cancelled."
+    case .connectionTimeout:
+      return "Bluetooth connection timed out."
     }
   }
 }

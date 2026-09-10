@@ -31,6 +31,14 @@ namespace flutter_thermal_printer {
 
 namespace {
 
+bool IsBluetoothTransport(const std::string& transport) {
+  return transport.rfind("bluetoothClassic", 0) == 0;
+}
+
+}  // namespace
+
+namespace {
+
 using flutter::EncodableList;
 using flutter::EncodableMap;
 using flutter::EncodableValue;
@@ -44,22 +52,22 @@ constexpr DWORD kUsbWriteTimeoutMs = 10'000;
 
 /// Writes diagnostic messages to the Windows debugger output.
 void BluetoothLog(const std::wstring& message) {
-  OutputDebugStringW((L"[FlutterThermalPrinterNative] windows.bluetooth " + message + L"\n").c_str());
+  OutputDebugStringW((L"[FlutterThermalPrinterNative] platform=windows transport=bluetoothClassic " + message + L"\n").c_str());
 }
 
 /// Writes USB transport diagnostics to the Windows debugger output.
 void UsbLog(const std::wstring& message) {
-  OutputDebugStringW((L"[FlutterThermalPrinterNative] windows.usb " + message + L"\n").c_str());
+  OutputDebugStringW((L"[FlutterThermalPrinterNative] platform=windows transport=usb " + message + L"\n").c_str());
 }
 
 /// Writes print lifecycle diagnostics to the Windows debugger output.
 void PrintLog(const std::wstring& message) {
-  OutputDebugStringW((L"[FlutterThermalPrinterNative] windows.print " + message + L"\n").c_str());
+  OutputDebugStringW((L"[FlutterThermalPrinterNative] platform=windows operation=print " + message + L"\n").c_str());
 }
 
 /// Writes connection lifecycle diagnostics to the Windows debugger output.
 void TransportLog(const std::wstring& message) {
-  OutputDebugStringW((L"[FlutterThermalPrinterNative] windows.transport " + message + L"\n").c_str());
+  OutputDebugStringW((L"[FlutterThermalPrinterNative] platform=windows operation=connect " + message + L"\n").c_str());
 }
 
 int64_t DurationMilliseconds(const std::chrono::steady_clock::time_point& started_at) {
@@ -303,16 +311,22 @@ void FlutterThermalPrinterPlugin::StartPrintWorker(
                                 "TRANSPORT_CANCELLED",
                                 "Windows print operation was cancelled.");
           } else {
+            const auto error_code = transport == "bluetoothClassic"
+                                        ? "BLUETOOTH_WRITE_FAILED"
+                                        : "USB_WRITE_FAILED";
+            const auto error_log = success
+                                       ? std::wstring(L" errorCode=SUCCESS")
+                                       : L" errorCode=" + WideFromUtf8(error_code);
             PrintLog((success ? L"completed id=" : L"failed id=") +
                      std::to_wstring(operation_id) +
                      L" transport=" + WideFromUtf8(transport) +
-                     (success ? L" errorCode=SUCCESS" : L" errorCode=TRANSPORT_FAILED") +
+                     error_log +
                      L" durationMs=" + std::to_wstring(DurationMilliseconds(started_at)));
             if (success) {
               CompleteResultBool(result_holder, result_mutex, completed, true);
             } else {
               CompleteResultError(result_holder, result_mutex, completed,
-                                  "TRANSPORT_FAILED",
+                                  error_code,
                                   "Windows print operation failed.");
             }
         }
@@ -325,7 +339,9 @@ void FlutterThermalPrinterPlugin::StartPrintWorker(
                    L" reason=exception durationMs=" +
                    std::to_wstring(DurationMilliseconds(started_at)));
           CompleteResultError(result_holder, result_mutex, completed,
-                              "TRANSPORT_FAILED",
+                              transport == "bluetoothClassic"
+                                  ? "BLUETOOTH_WRITE_FAILED"
+                                  : "USB_WRITE_FAILED",
                               "Windows print operation failed unexpectedly.");
           print_active_.store(false);
         }
@@ -426,35 +442,40 @@ void FlutterThermalPrinterPlugin::StartConnectionWorker(
       } else if (return_false_as_value) {
         TransportLog(L"connection.checked id=" + std::to_wstring(operation_id) +
                      L" transport=" + WideFromUtf8(transport) +
-                     L" errorCode=DEVICE_UNAVAILABLE" +
+                     L" errorCode=NONE" +
                      L" durationMs=" + std::to_wstring(DurationMilliseconds(started_at)));
         CompleteResultBool(result_holder, result_mutex, completed, false);
       } else {
         TransportLog(L"connection.failed id=" + std::to_wstring(operation_id) +
                      L" transport=" + WideFromUtf8(transport) +
                      L" errorCode=" +
-                     WideFromUtf8(transport == "bluetoothClassic"
+                     WideFromUtf8(IsBluetoothTransport(transport)
                                       ? "BLUETOOTH_CONNECT_FAILED"
                                       : "USB_OPEN_FAILED") +
                      L" durationMs=" + std::to_wstring(DurationMilliseconds(started_at)));
         CompleteResultError(
             result_holder, result_mutex, completed,
-            transport == "bluetoothClassic" ? "BLUETOOTH_CONNECT_FAILED" : "USB_OPEN_FAILED",
-            transport == "bluetoothClassic"
+            IsBluetoothTransport(transport) ? "BLUETOOTH_CONNECT_FAILED" : "USB_OPEN_FAILED",
+            IsBluetoothTransport(transport)
                 ? "Windows could not connect to the Bluetooth printer."
                 : "Windows could not open the USB printer.");
       }
       connection_active_.store(false);
     } catch (...) {
       done->store(true);
+      const char* error_code = IsBluetoothTransport(transport)
+                                   ? "BLUETOOTH_CONNECT_FAILED"
+                                   : "USB_OPEN_FAILED";
       TransportLog(L"connection.failed id=" + std::to_wstring(operation_id) +
                    L" transport=" + WideFromUtf8(transport) +
-                   L" errorCode=TRANSPORT_CONNECT_FAILED" +
+                   L" errorCode=" + WideFromUtf8(error_code) +
                    L" reason=exception durationMs=" +
                    std::to_wstring(DurationMilliseconds(started_at)));
       CompleteResultError(result_holder, result_mutex, completed,
-                          "TRANSPORT_CONNECT_FAILED",
-                          "Windows transport connection failed unexpectedly.");
+                          error_code,
+                          IsBluetoothTransport(transport)
+                              ? "Windows Bluetooth connection failed unexpectedly."
+                              : "Windows USB connection failed unexpectedly.");
       connection_active_.store(false);
     }
   });
@@ -851,6 +872,14 @@ void FlutterThermalPrinterPlugin::HandleMethodCall(
   } else if (method_call.method_name().compare("printText") == 0 && is_bluetooth_classic) {
     const auto address = StringValue(*arguments, "address");
     const auto bytes = BytesValue(*arguments, "data");
+    if (NormalizeAddress(address).empty()) {
+      result->Error("DEVICE_UNAVAILABLE", "The Bluetooth printer address is missing or invalid.");
+      return;
+    }
+    if (bytes.empty()) {
+      result->Error("BLUETOOTH_WRITE_FAILED", "The Bluetooth print payload is empty.");
+      return;
+    }
     StartPrintWorker(
         [this, address, bytes](const CancellationToken& cancellation) {
           return PrintBluetoothClassic(address, bytes, cancellation);
@@ -865,6 +894,10 @@ void FlutterThermalPrinterPlugin::HandleMethodCall(
     result->Success();
   } else if (method_call.method_name().compare("isConnected") == 0 && is_bluetooth_classic) {
     const auto address = StringValue(*arguments, "address");
+    if (NormalizeAddress(address).empty()) {
+      result->Error("DEVICE_UNAVAILABLE", "The Bluetooth printer address is missing or invalid.");
+      return;
+    }
     StartConnectionWorker(
         [this, address](const CancellationToken&) {
           return IsBluetoothClassicConnected(address);
@@ -873,12 +906,16 @@ void FlutterThermalPrinterPlugin::HandleMethodCall(
         std::move(result), true);
   } else if (method_call.method_name().compare("disconnect") == 0 && is_bluetooth_classic) {
     const auto address = StringValue(*arguments, "address");
+    if (NormalizeAddress(address).empty()) {
+      result->Error("DEVICE_UNAVAILABLE", "The Bluetooth printer address is missing or invalid.");
+      return;
+    }
     StartConnectionWorker(
         [this, address](const CancellationToken&) {
           return DisconnectBluetoothClassic(address);
         },
         "bluetoothClassic.disconnect",
-        std::move(result), true);
+        std::move(result));
   } else if (method_call.method_name().compare("connect") == 0 && is_usb) {
     const auto device_path = StringValue(*arguments, "address");
     if (device_path.empty()) {
@@ -894,6 +931,14 @@ void FlutterThermalPrinterPlugin::HandleMethodCall(
   } else if (method_call.method_name().compare("printText") == 0 && is_usb) {
     const auto device_path = StringValue(*arguments, "address");
     const auto bytes = BytesValue(*arguments, "data");
+    if (device_path.empty()) {
+      result->Error("DEVICE_UNAVAILABLE", "The USB printer device path is missing.");
+      return;
+    }
+    if (bytes.empty()) {
+      result->Error("USB_WRITE_FAILED", "The USB print payload is empty.");
+      return;
+    }
     StartPrintWorker(
         [device_path, bytes](const CancellationToken& cancellation) {
           return PrintUsbPrinter(device_path, bytes, cancellation);
@@ -902,6 +947,10 @@ void FlutterThermalPrinterPlugin::HandleMethodCall(
         std::move(result));
   } else if (method_call.method_name().compare("isConnected") == 0 && is_usb) {
     const auto device_path = StringValue(*arguments, "address");
+    if (device_path.empty()) {
+      result->Error("DEVICE_UNAVAILABLE", "The USB printer device path is missing.");
+      return;
+    }
     StartConnectionWorker(
         [this, device_path](const CancellationToken&) {
           return CanOpenUsbPrinter(device_path);

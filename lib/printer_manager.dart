@@ -118,49 +118,37 @@ class PrinterManager {
           return false;
         }
         final address = device.address!;
+        final deadline = Stopwatch()..start();
         _ensureBleConnectionListener(address, fallbackName: device.name);
 
-        final isConnected = await _isBleDeviceConnected(address);
+        final isConnected = await _isBleDeviceConnected(address).timeout(
+          _remaining(deadline, bleConfig.connectionTimeout),
+        );
         if (isConnected) {
           _updateBleConnectionState(address, true, fallbackName: device.name);
           log('Device ${device.name} is already connected');
           return true;
         }
-        final connectionCompleter = Completer<bool>();
         log('Connecting to BLE device ${device.name} at ${device.address}');
 
-        StreamSubscription? subscription;
-
         try {
-          // Listen to global connection changes
-          subscription = device.connectionStream.listen((state) {
-            log('Connection state changed for device ${device.name}: $state');
-            if (state) {
-              if (!connectionCompleter.isCompleted) {
-                connectionCompleter.complete(true);
-              }
-            }
-          });
-
-          await UniversalBle.connect(address).timeout(
-            bleConfig.connectionTimeout,
+          await UniversalBle.connect(
+            address,
+            timeout: _remaining(deadline, bleConfig.connectionTimeout),
           );
           final delay = connectionStabilizationDelay ??
               bleConfig.connectionStabilizationDelay;
-          final connected = await connectionCompleter.future.timeout(
-            bleConfig.connectionTimeout,
-            onTimeout: () {
-              log('BLE connection timed out operation=$operationId '
-                  'device=${device.name}');
-              return false;
-            },
+          final connected = await _isBleDeviceConnected(address).timeout(
+            _remaining(deadline, bleConfig.connectionTimeout),
           );
           if (_activeBleConnectionOperationId != operationId) {
             log('Ignoring stale BLE connection result operation=$operationId');
             return false;
           }
           if (connected && delay > Duration.zero) {
-            await Future<void>.delayed(delay);
+            await Future<void>.delayed(
+              _remaining(deadline, bleConfig.connectionTimeout, maximum: delay),
+            );
           }
           if (!connected) {
             try {
@@ -174,17 +162,21 @@ class PrinterManager {
           return connected;
         } catch (e) {
           log('Error connecting to device: $e');
+          await _disconnectBleAfterOperation(
+            address,
+            operationId: operationId,
+            reason: 'connect failure',
+          );
           return false;
-        } finally {
-          await subscription?.cancel();
-          if (_activeBleConnectionOperationId == operationId) {
-            _activeBleConnectionOperationId = null;
-            _activeBleConnectionDevice = null;
-          }
         }
       } catch (e) {
         log('Failed to connect to BLE device: $e');
         return false;
+      } finally {
+        if (_activeBleConnectionOperationId == operationId) {
+          _activeBleConnectionOperationId = null;
+          _activeBleConnectionDevice = null;
+        }
       }
     } else if (device.connectionType == ConnectionType.NETWORK) {
       // TCP network printers connect on demand in printData; nothing to do here.
@@ -253,11 +245,11 @@ class PrinterManager {
     final device = _activeBleConnectionDevice;
     _activeBleConnectionDevice = null;
     if (device != null && device.connectionType == ConnectionType.BLE) {
-      try {
-        await device.disconnect();
-      } catch (error) {
-        log('Failed to cancel BLE connection: $error');
-      }
+      await _disconnectBleAfterOperation(
+        device.address,
+        operationId: null,
+        reason: 'connect cancellation',
+      );
     }
     if (Platform.isWindows) {
       await FlutterThermalPrinterPlatform.instance.cancelConnect();
@@ -302,8 +294,11 @@ class PrinterManager {
       return FlutterThermalPrinterPlatform.instance
           .printText(printer, Uint8List.fromList(bytes));
     } else if (printer.connectionType == ConnectionType.BLE) {
+      final deadline = Stopwatch()..start();
       try {
-        final services = await printer.discoverServices();
+        final services = await printer.discoverServices(
+          timeout: _remaining(deadline, bleConfig.printTimeout),
+        );
 
         // Star ISSC (TSP100IIIBI) and some other BLE printer chips expose
         // their write characteristic with `writeWithoutResponse` only — we
@@ -331,9 +326,16 @@ class PrinterManager {
         final mtu = chunkSize ??
             (Platform.isWindows
                 ? 50
-                : await printer.requestMtu(
-                    Platform.isMacOS || Platform.isLinux ? 150 : 500));
+                : await UniversalBle.requestMtu(
+                    printer.deviceId,
+                    Platform.isMacOS || Platform.isLinux ? 150 : 500,
+                    timeout: _remaining(deadline, bleConfig.printTimeout),
+                  ));
         final maxChunkSize = mtu - 3;
+        if (maxChunkSize <= 0) {
+          log('Invalid BLE chunk size: mtu=$mtu');
+          return false;
+        }
 
         for (var i = 0; i < bytes.length; i += maxChunkSize) {
           final chunk = bytes.sublist(
@@ -342,13 +344,20 @@ class PrinterManager {
                   ? bytes.length
                   : i + maxChunkSize);
 
-          await writeCharacteristic
-              .write(Uint8List.fromList(chunk))
-              .timeout(bleConfig.printTimeout);
+          await writeCharacteristic.write(
+            Uint8List.fromList(chunk),
+            timeout: _remaining(deadline, bleConfig.printTimeout),
+          );
 
           // Small delay between chunks to avoid overwhelming the device
           if (longData) {
-            await Future.delayed(const Duration(milliseconds: 10));
+            await Future<void>.delayed(
+              _remaining(
+                deadline,
+                bleConfig.printTimeout,
+                maximum: const Duration(milliseconds: 10),
+              ),
+            );
           }
 
           ///
@@ -383,6 +392,45 @@ class PrinterManager {
 
   bool _usesWindowsUsbDevicePath(Printer printer) =>
       printer.address?.startsWith(r'\\?\') ?? false;
+
+  Duration _remaining(
+    Stopwatch stopwatch,
+    Duration deadline, {
+    Duration? maximum,
+  }) {
+    final remaining = deadline - stopwatch.elapsed;
+    if (remaining <= Duration.zero) {
+      throw TimeoutException('BLE operation deadline exceeded');
+    }
+    if (maximum == null || remaining <= maximum) {
+      return remaining;
+    }
+    return maximum;
+  }
+
+  Future<void> _disconnectBleAfterOperation(
+    String? deviceId, {
+    required int? operationId,
+    required String reason,
+  }) async {
+    if (deviceId == null || deviceId.isEmpty) {
+      return;
+    }
+    try {
+      await UniversalBle.disconnect(deviceId).timeout(
+        const Duration(seconds: 3),
+      );
+      log(
+        'BLE cleanup completed operation=$operationId '
+        'device=$deviceId reason=$reason',
+      );
+    } catch (error) {
+      log(
+        'BLE cleanup failed operation=$operationId '
+        'device=$deviceId reason=$reason error=$error',
+      );
+    }
+  }
 
   /// Get Printers from BT and USB
   Future<void> getPrinters({

@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -20,8 +21,17 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
+
+using TransportDeadline = std::chrono::steady_clock::time_point;
+static constexpr auto kTransportTimeout = std::chrono::seconds(30);
 
 // ---------------------------------------------------------------------------
 // GObject boilerplate
@@ -101,7 +111,8 @@ static bool cups_printer_exists(const char* printer_name) {
 // ALL driver filters and delivers bytes unmodified to the printer.
 static bool lp_print_raw(const char* printer_name,
                          const uint8_t* data,
-                         size_t data_len) {
+                         size_t data_len,
+                         TransportDeadline deadline) {
   // Write data to a secure temp file.
   char tmp_path[] = "/tmp/flutter_thermal_XXXXXX";
   const int fd = mkstemp(tmp_path);
@@ -141,9 +152,27 @@ static bool lp_print_raw(const char* printer_name,
     _exit(EXIT_FAILURE);  // execl failed.
   }
 
-  // Parent: wait for child to finish.
+  // Parent: wait for child to finish without blocking beyond the operation deadline.
   int status = 0;
-  waitpid(pid, &status, 0);
+  while (true) {
+    const pid_t wait_result = waitpid(pid, &status, WNOHANG);
+    if (wait_result == pid) break;
+    if (wait_result < 0) {
+      unlink(tmp_path);
+      return false;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      kill(pid, SIGTERM);
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      if (waitpid(pid, &status, WNOHANG) == 0) {
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+      }
+      unlink(tmp_path);
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
   unlink(tmp_path);
 
   return WIFEXITED(status) && WEXITSTATUS(status) == 0;
@@ -215,11 +244,22 @@ static std::vector<uint8_t> bytes_from_value(FlValue* value) {
 }
 
 static void bluetooth_log(const std::string& message) {
-  g_message("[FlutterThermalPrinterNative] linux.bluetooth %s", message.c_str());
+  g_message("[FlutterThermalPrinterNative] platform=linux transport=bluetoothClassic %s", message.c_str());
 }
 
 static void usb_log(const std::string& message) {
-  g_message("[FlutterThermalPrinterNative] linux.usb %s", message.c_str());
+  g_message("[FlutterThermalPrinterNative] platform=linux transport=usb %s", message.c_str());
+}
+
+static void cups_log(const std::string& message) {
+  g_message("[FlutterThermalPrinterNative] platform=linux transport=cups %s", message.c_str());
+}
+
+static int remainingTransferTimeout(TransportDeadline deadline) {
+  const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+      deadline - std::chrono::steady_clock::now()).count();
+  if (remaining <= 0) return 0;
+  return static_cast<int>(std::min<int64_t>(remaining, 10'000));
 }
 
 struct LibusbPrinterAddress {
@@ -332,7 +372,9 @@ static bool find_printer_endpoint(
 }
 
 static bool libusb_transfer_data(
-    const std::string& address, const std::vector<uint8_t>* bytes) {
+    const std::string& address,
+    const std::vector<uint8_t>* bytes,
+    TransportDeadline deadline) {
   LibusbPrinterAddress parsed;
   if (!parse_libusb_printer_address(address, &parsed)) {
     usb_log("connection.failed reason=invalid_libusb_address address=" + address);
@@ -358,6 +400,12 @@ static bool libusb_transfer_data(
       if (bytes != nullptr) {
         size_t offset = 0;
         while (offset < bytes->size()) {
+          const int timeout = remainingTransferTimeout(deadline);
+          if (timeout <= 0) {
+            usb_log("print.timeout stage=bulk_transfer");
+            success = false;
+            break;
+          }
           const int transfer_size = static_cast<int>(std::min<size_t>(16 * 1024, bytes->size() - offset));
           int transferred = 0;
           const int transfer_result = libusb_bulk_transfer(
@@ -366,7 +414,7 @@ static bool libusb_transfer_data(
               const_cast<unsigned char*>(bytes->data() + offset),
               transfer_size,
               &transferred,
-              10'000);
+              timeout);
           if (transfer_result != 0 || transferred <= 0) {
             usb_log("print.failed stage=bulk_transfer error=" +
                     std::string(libusb_error_name(transfer_result)));
@@ -399,9 +447,9 @@ static bool is_usb_printer_device_path(const std::string& path) {
       [](unsigned char character) { return std::isdigit(character) != 0; });
 }
 
-static bool can_access_usb_printer(const std::string& path) {
+static bool can_access_usb_printer(const std::string& path, TransportDeadline deadline) {
   if (path.rfind("libusb:", 0) == 0) {
-    const bool connected = libusb_transfer_data(path, nullptr);
+    const bool connected = libusb_transfer_data(path, nullptr, deadline);
     usb_log("connection.checked path=" + path + " connected=" + std::to_string(connected));
     return connected;
   }
@@ -419,34 +467,52 @@ static bool can_access_usb_printer(const std::string& path) {
   return true;
 }
 
-static bool print_usb_printer(const std::string& path, const std::vector<uint8_t>& bytes) {
+class ScopedFileDescriptor {
+ public:
+  explicit ScopedFileDescriptor(int descriptor) : descriptor_(descriptor) {}
+  ~ScopedFileDescriptor() {
+    if (descriptor_ >= 0) close(descriptor_);
+  }
+  int get() const { return descriptor_; }
+  bool valid() const { return descriptor_ >= 0; }
+
+ private:
+  int descriptor_;
+};
+
+static bool print_usb_printer(
+    const std::string& path,
+    const std::vector<uint8_t>& bytes,
+    TransportDeadline deadline) {
   if (path.rfind("libusb:", 0) == 0) {
-    const bool printed = libusb_transfer_data(path, &bytes);
+    const bool printed = libusb_transfer_data(path, &bytes, deadline);
     if (printed) usb_log("print.success path=" + path + " bytes=" + std::to_string(bytes.size()));
     return printed;
   }
-  if (!can_access_usb_printer(path)) return false;
+  if (!can_access_usb_printer(path, deadline)) return false;
   if (bytes.empty()) return true;
 
-  const int file_descriptor = open(path.c_str(), O_WRONLY | O_NONBLOCK);
-  if (file_descriptor < 0) {
+  ScopedFileDescriptor file_descriptor(open(path.c_str(), O_WRONLY | O_NONBLOCK));
+  if (!file_descriptor.valid()) {
     usb_log("print.failed stage=open path=" + path + " errno=" + std::to_string(errno));
     return false;
   }
 
   size_t offset = 0;
   while (offset < bytes.size()) {
-    const ssize_t written = write(file_descriptor, bytes.data() + offset, bytes.size() - offset);
+    if (std::chrono::steady_clock::now() >= deadline) {
+      usb_log("print.timeout stage=write path=" + path);
+      return false;
+    }
+    const ssize_t written = write(file_descriptor.get(), bytes.data() + offset, bytes.size() - offset);
     if (written <= 0) {
       usb_log(
           "print.failed stage=write path=" + path + " offset=" + std::to_string(offset) +
           " errno=" + std::to_string(errno));
-      close(file_descriptor);
       return false;
     }
     offset += static_cast<size_t>(written);
   }
-  close(file_descriptor);
   usb_log("print.success path=" + path + " bytes=" + std::to_string(bytes.size()));
   return true;
 }
@@ -473,7 +539,7 @@ static void free_service_records(sdp_list_t* records) {
   sdp_list_free(records, nullptr);
 }
 
-static int serial_port_channel(const bdaddr_t& target) {
+static int serial_port_channel(const bdaddr_t& target, TransportDeadline deadline) {
   char target_address[18]{};
   ba2str(&target, target_address);
   bluetooth_log("sdp.started address=" + std::string(target_address));
@@ -485,6 +551,7 @@ static int serial_port_channel(const bdaddr_t& target) {
   sdp_list_t* attribute_list = sdp_list_append(nullptr, &range);
   sdp_list_t* response_list = nullptr;
   const bdaddr_t any = {{0, 0, 0, 0, 0, 0}};
+  if (std::chrono::steady_clock::now() >= deadline) return -1;
   sdp_session_t* session = sdp_connect(&any, &target, SDP_RETRY_IF_BUSY);
   if (session == nullptr) {
     bluetooth_log("sdp.failed stage=connect errno=" + std::to_string(errno));
@@ -492,10 +559,25 @@ static int serial_port_channel(const bdaddr_t& target) {
     sdp_list_free(attribute_list, nullptr);
     return -1;
   }
+  if (std::chrono::steady_clock::now() >= deadline) {
+    sdp_close(session);
+    sdp_list_free(search_list, nullptr);
+    sdp_list_free(attribute_list, nullptr);
+    bluetooth_log("sdp.timeout stage=connect address=" + std::string(target_address));
+    return -1;
+  }
   bluetooth_log("sdp.connected address=" + std::string(target_address));
 
   const int status = sdp_service_search_attr_req(
       session, search_list, SDP_ATTR_REQ_RANGE, attribute_list, &response_list);
+  if (std::chrono::steady_clock::now() >= deadline) {
+    free_service_records(response_list);
+    sdp_list_free(search_list, nullptr);
+    sdp_list_free(attribute_list, nullptr);
+    sdp_close(session);
+    bluetooth_log("sdp.timeout stage=search address=" + std::string(target_address));
+    return -1;
+  }
   int channel = -1;
   if (status == 0) {
     for (sdp_list_t* record_node = response_list; record_node != nullptr && channel < 0;
@@ -521,7 +603,10 @@ static int serial_port_channel(const bdaddr_t& target) {
   return channel;
 }
 
-static bool connect_rfcomm_socket(int socket_fd, const sockaddr_rc& remote) {
+static bool connect_rfcomm_socket(
+    int socket_fd,
+    const sockaddr_rc& remote,
+    TransportDeadline deadline) {
   const int previous_flags = fcntl(socket_fd, F_GETFL, 0);
   if (previous_flags < 0 || fcntl(socket_fd, F_SETFL, previous_flags | O_NONBLOCK) < 0) {
     bluetooth_log("connect.failed stage=nonblocking errno=" + std::to_string(errno));
@@ -541,8 +626,11 @@ static bool connect_rfcomm_socket(int socket_fd, const sockaddr_rc& remote) {
   fd_set write_set;
   FD_ZERO(&write_set);
   FD_SET(socket_fd, &write_set);
+  const int timeout_ms = remainingTransferTimeout(deadline);
+  if (timeout_ms <= 0) return false;
   timeval timeout{};
-  timeout.tv_sec = 10;
+  timeout.tv_sec = timeout_ms / 1000;
+  timeout.tv_usec = (timeout_ms % 1000) * 1000;
   const int selected = select(socket_fd + 1, nullptr, &write_set, nullptr, &timeout);
   int socket_error = 0;
   socklen_t socket_error_size = sizeof(socket_error);
@@ -558,14 +646,17 @@ static bool connect_rfcomm_socket(int socket_fd, const sockaddr_rc& remote) {
   return connected;
 }
 
-static bool print_bluetooth_classic(const std::string& address, const std::vector<uint8_t>& bytes) {
+static bool print_bluetooth_classic(
+    const std::string& address,
+    const std::vector<uint8_t>& bytes,
+    TransportDeadline deadline) {
   if (bytes.empty()) return true;
   bdaddr_t target{};
   if (!bluetooth_address_from_string(address, &target)) {
     bluetooth_log("print.failed reason=invalid_address address=" + address);
     return false;
   }
-  const int channel = serial_port_channel(target);
+  const int channel = serial_port_channel(target, deadline);
   if (channel <= 0) {
     bluetooth_log("print.failed reason=serial_port_profile_unavailable address=" + address);
     return false;
@@ -576,8 +667,14 @@ static bool print_bluetooth_classic(const std::string& address, const std::vecto
     bluetooth_log("print.failed stage=socket errno=" + std::to_string(errno));
     return false;
   }
+  const int timeout_ms = remainingTransferTimeout(deadline);
+  if (timeout_ms <= 0) {
+    close(socket_fd);
+    return false;
+  }
   timeval timeout{};
-  timeout.tv_sec = 10;
+  timeout.tv_sec = timeout_ms / 1000;
+  timeout.tv_usec = (timeout_ms % 1000) * 1000;
   setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
   setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
@@ -587,7 +684,7 @@ static bool print_bluetooth_classic(const std::string& address, const std::vecto
   remote.rc_channel = static_cast<uint8_t>(channel);
   bluetooth_log(
       "connect.started address=" + address + " channel=" + std::to_string(channel));
-  if (!connect_rfcomm_socket(socket_fd, remote)) {
+  if (!connect_rfcomm_socket(socket_fd, remote, deadline)) {
     close(socket_fd);
     return false;
   }
@@ -595,6 +692,11 @@ static bool print_bluetooth_classic(const std::string& address, const std::vecto
   constexpr size_t kChunkSize = 1'024;
   size_t offset = 0;
   while (offset < bytes.size()) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      bluetooth_log("print.timeout stage=write address=" + address);
+      close(socket_fd);
+      return false;
+    }
     const size_t size = std::min(kChunkSize, bytes.size() - offset);
     const ssize_t written = write(socket_fd, bytes.data() + offset, size);
     if (written <= 0) {
@@ -610,22 +712,30 @@ static bool print_bluetooth_classic(const std::string& address, const std::vecto
   return true;
 }
 
-static bool can_connect_bluetooth_classic(const std::string& address) {
+static bool can_connect_bluetooth_classic(
+    const std::string& address,
+    TransportDeadline deadline) {
   bdaddr_t target{};
   if (!bluetooth_address_from_string(address, &target)) return false;
-  const int channel = serial_port_channel(target);
+  const int channel = serial_port_channel(target, deadline);
   if (channel <= 0) return false;
 
   const int socket_fd = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
   if (socket_fd < 0) return false;
+  const int timeout_ms = remainingTransferTimeout(deadline);
+  if (timeout_ms <= 0) {
+    close(socket_fd);
+    return false;
+  }
   timeval timeout{};
-  timeout.tv_sec = 10;
+  timeout.tv_sec = timeout_ms / 1000;
+  timeout.tv_usec = (timeout_ms % 1000) * 1000;
   setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
   sockaddr_rc remote{};
   remote.rc_family = AF_BLUETOOTH;
   remote.rc_bdaddr = target;
   remote.rc_channel = static_cast<uint8_t>(channel);
-  const bool connected = connect_rfcomm_socket(socket_fd, remote);
+  const bool connected = connect_rfcomm_socket(socket_fd, remote, deadline);
   close(socket_fd);
   bluetooth_log(
       "connection.checked address=" + address + " channel=" + std::to_string(channel) +
@@ -640,15 +750,23 @@ struct BluetoothOperation {
   BluetoothOperationKind kind;
   std::string address;
   std::vector<uint8_t> bytes;
+  uint64_t operation_id;
   bool success = false;
+  bool return_false_as_value = false;
 };
+
+static std::atomic<uint64_t> next_bluetooth_operation_id{0};
 
 static gboolean complete_bluetooth_operation(gpointer user_data) {
   auto* operation = static_cast<BluetoothOperation*>(user_data);
   g_autoptr(FlMethodResponse) response = nullptr;
   if (operation->kind == BluetoothOperationKind::print && !operation->success) {
     response = FL_METHOD_RESPONSE(fl_method_error_response_new(
-        "PRINT_ERROR", "Unable to write data to the Bluetooth printer", nullptr));
+        "BLUETOOTH_WRITE_FAILED", "Unable to write data to the Bluetooth printer", nullptr));
+  } else if (operation->kind == BluetoothOperationKind::connect &&
+             !operation->success && !operation->return_false_as_value) {
+    response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+        "BLUETOOTH_CONNECT_FAILED", "Unable to connect to the Bluetooth printer", nullptr));
   } else {
     g_autoptr(FlValue) result = fl_value_new_bool(operation->success ? TRUE : FALSE);
     response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
@@ -661,19 +779,153 @@ static gboolean complete_bluetooth_operation(gpointer user_data) {
 
 static gpointer run_bluetooth_operation(gpointer user_data) {
   auto* operation = static_cast<BluetoothOperation*>(user_data);
+  const auto started_at = std::chrono::steady_clock::now();
+  const auto deadline = started_at + kTransportTimeout;
   bluetooth_log(
-      "operation.started kind=" +
+      "operation.started id=" + std::to_string(operation->operation_id) + " kind=" +
       std::string(operation->kind == BluetoothOperationKind::print ? "print" : "connect") +
       " address=" + operation->address);
   operation->success = operation->kind == BluetoothOperationKind::print
-      ? print_bluetooth_classic(operation->address, operation->bytes)
-      : can_connect_bluetooth_classic(operation->address);
+      ? print_bluetooth_classic(operation->address, operation->bytes, deadline)
+      : can_connect_bluetooth_classic(operation->address, deadline);
+  const char* error_code = operation->success
+      ? "SUCCESS"
+      : (operation->return_false_as_value
+             ? "NONE"
+             : (operation->kind == BluetoothOperationKind::print
+                    ? "BLUETOOTH_WRITE_FAILED"
+                    : "BLUETOOTH_CONNECT_FAILED"));
+  const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started_at).count();
+  bluetooth_log(
+      "operation.completed id=" + std::to_string(operation->operation_id) +
+      " success=" + std::to_string(operation->success) +
+      " errorCode=" + error_code +
+      " durationMs=" + std::to_string(duration));
   g_main_context_invoke(nullptr, complete_bluetooth_operation, operation);
   return nullptr;
 }
 
 static void start_bluetooth_operation(BluetoothOperation* operation) {
   GThread* thread = g_thread_new("thermal-bluetooth", run_bluetooth_operation, operation);
+  g_thread_unref(thread);
+}
+
+enum class UsbOperationKind { connect, print };
+
+struct UsbOperation {
+  FlMethodCall* method_call;
+  UsbOperationKind kind;
+  std::string path;
+  std::vector<uint8_t> bytes;
+  uint64_t operation_id;
+  bool success = false;
+  bool return_false_as_value = false;
+};
+
+static std::atomic<uint64_t> next_usb_operation_id{0};
+
+static gboolean complete_usb_operation(gpointer user_data) {
+  auto* operation = static_cast<UsbOperation*>(user_data);
+  g_autoptr(FlMethodResponse) response = nullptr;
+  if (operation->kind == UsbOperationKind::print && !operation->success) {
+    response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+        "USB_WRITE_FAILED", "Unable to write data to the USB printer", nullptr));
+  } else if (operation->kind == UsbOperationKind::connect &&
+             !operation->success && !operation->return_false_as_value) {
+    response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+        "USB_OPEN_FAILED", "Unable to open the USB printer", nullptr));
+  } else {
+    g_autoptr(FlValue) result = fl_value_new_bool(operation->success ? TRUE : FALSE);
+    response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
+  }
+  fl_method_call_respond(operation->method_call, response, nullptr);
+  g_object_unref(operation->method_call);
+  delete operation;
+  return G_SOURCE_REMOVE;
+}
+
+static gpointer run_usb_operation(gpointer user_data) {
+  auto* operation = static_cast<UsbOperation*>(user_data);
+  const auto started_at = std::chrono::steady_clock::now();
+  const auto deadline = started_at + kTransportTimeout;
+  usb_log("operation.started id=" + std::to_string(operation->operation_id) +
+          " kind=" + (operation->kind == UsbOperationKind::print ? "print" : "connect") +
+          " path=" + operation->path);
+  operation->success = operation->kind == UsbOperationKind::print
+      ? print_usb_printer(operation->path, operation->bytes, deadline)
+      : can_access_usb_printer(operation->path, deadline);
+  const char* error_code = operation->success
+      ? "SUCCESS"
+      : (operation->return_false_as_value
+             ? "NONE"
+             : (operation->kind == UsbOperationKind::print
+                    ? "USB_WRITE_FAILED"
+                    : "USB_OPEN_FAILED"));
+  const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started_at).count();
+  usb_log("operation.completed id=" + std::to_string(operation->operation_id) +
+          " success=" + std::to_string(operation->success) +
+          " errorCode=" + error_code +
+          " durationMs=" + std::to_string(duration));
+  g_main_context_invoke(nullptr, complete_usb_operation, operation);
+  return nullptr;
+}
+
+static void start_usb_operation(UsbOperation* operation) {
+  GThread* thread = g_thread_new("thermal-usb", run_usb_operation, operation);
+  g_thread_unref(thread);
+}
+
+struct CupsPrintOperation {
+  FlMethodCall* method_call;
+  std::string printer_name;
+  std::vector<uint8_t> bytes;
+  uint64_t operation_id;
+  bool success = false;
+};
+
+static std::atomic<uint64_t> next_cups_operation_id{0};
+
+static gboolean complete_cups_print_operation(gpointer user_data) {
+  auto* operation = static_cast<CupsPrintOperation*>(user_data);
+  g_autoptr(FlMethodResponse) response = nullptr;
+  if (!operation->success) {
+    response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+        "PRINT_ERROR", "Failed to submit CUPS print job", nullptr));
+  } else {
+    g_autoptr(FlValue) result = fl_value_new_bool(TRUE);
+    response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
+  }
+  fl_method_call_respond(operation->method_call, response, nullptr);
+  g_object_unref(operation->method_call);
+  delete operation;
+  return G_SOURCE_REMOVE;
+}
+
+static gpointer run_cups_print_operation(gpointer user_data) {
+  auto* operation = static_cast<CupsPrintOperation*>(user_data);
+  const auto started_at = std::chrono::steady_clock::now();
+  const auto deadline = started_at + kTransportTimeout;
+  cups_log("operation.started id=" + std::to_string(operation->operation_id) +
+          " printer=" + operation->printer_name);
+  operation->success = lp_print_raw(
+      operation->printer_name.c_str(), operation->bytes.data(), operation->bytes.size(), deadline);
+  if (!operation->success && std::chrono::steady_clock::now() < deadline) {
+    operation->success = cups_print_raw(
+        operation->printer_name.c_str(), operation->bytes.data(), operation->bytes.size());
+  }
+  const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started_at).count();
+  cups_log("operation.completed id=" + std::to_string(operation->operation_id) +
+          " success=" + std::to_string(operation->success) +
+          " durationMs=" + std::to_string(duration));
+  g_main_context_invoke(nullptr, complete_cups_print_operation, operation);
+  return nullptr;
+}
+
+static void start_cups_print_operation(CupsPrintOperation* operation) {
+  GThread* thread = g_thread_new("thermal-cups-print", run_cups_print_operation, operation);
   g_thread_unref(thread);
 }
 
@@ -708,19 +960,37 @@ static void method_call_cb(FlMethodChannel* channel,
     const std::string connection_type = map_get_string(args, "connectionType");
     if (connection_type == "BLUETOOTH_CLASSIC") {
       const auto address = map_get_string(args, "address");
+      if (address.empty()) {
+        response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+            "DEVICE_UNAVAILABLE", "Bluetooth printer address is missing", nullptr));
+        fl_method_call_respond(method_call, response, nullptr);
+        return;
+      }
       auto* operation = new BluetoothOperation{
           FL_METHOD_CALL(g_object_ref(method_call)),
           BluetoothOperationKind::connect,
           address,
+          ++next_bluetooth_operation_id,
       };
       start_bluetooth_operation(operation);
       return;
     }
     if (connection_type == "USB") {
       const auto path = map_get_string(args, "address");
-      g_autoptr(FlValue) result = fl_value_new_bool(can_access_usb_printer(path) ? TRUE : FALSE);
-      response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
-      fl_method_call_respond(method_call, response, nullptr);
+      if (path.empty()) {
+        response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+            "DEVICE_UNAVAILABLE", "USB printer path is missing", nullptr));
+        fl_method_call_respond(method_call, response, nullptr);
+        return;
+      }
+      auto* operation = new UsbOperation{
+          FL_METHOD_CALL(g_object_ref(method_call)),
+          UsbOperationKind::connect,
+          path,
+          {},
+          ++next_usb_operation_id,
+      };
+      start_usb_operation(operation);
       return;
     }
     const std::string name = map_get_string(args, "name");
@@ -740,19 +1010,39 @@ static void method_call_cb(FlMethodChannel* channel,
     const std::string connection_type = map_get_string(args, "connectionType");
     if (connection_type == "BLUETOOTH_CLASSIC") {
       const auto address = map_get_string(args, "address");
+      if (address.empty()) {
+        response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+            "DEVICE_UNAVAILABLE", "Bluetooth printer address is missing", nullptr));
+        fl_method_call_respond(method_call, response, nullptr);
+        return;
+      }
       auto* operation = new BluetoothOperation{
           FL_METHOD_CALL(g_object_ref(method_call)),
           BluetoothOperationKind::connect,
           address,
+          ++next_bluetooth_operation_id,
       };
+      operation->return_false_as_value = true;
       start_bluetooth_operation(operation);
       return;
     }
     if (connection_type == "USB") {
       const auto path = map_get_string(args, "address");
-      g_autoptr(FlValue) result = fl_value_new_bool(can_access_usb_printer(path) ? TRUE : FALSE);
-      response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
-      fl_method_call_respond(method_call, response, nullptr);
+      if (path.empty()) {
+        response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+            "DEVICE_UNAVAILABLE", "USB printer path is missing", nullptr));
+        fl_method_call_respond(method_call, response, nullptr);
+        return;
+      }
+      auto* operation = new UsbOperation{
+          FL_METHOD_CALL(g_object_ref(method_call)),
+          UsbOperationKind::connect,
+          path,
+          {},
+          ++next_usb_operation_id,
+      };
+      operation->return_false_as_value = true;
+      start_usb_operation(operation);
       return;
     }
     // The Dart layer sends vendorId = CUPS queue name (set in getUsbDevicesList).
@@ -780,13 +1070,17 @@ static void method_call_cb(FlMethodChannel* channel,
         const auto data_bytes = bytes_from_value(data_val);
         if (address.empty() || data_bytes.empty()) {
           response = FL_METHOD_RESPONSE(fl_method_error_response_new(
-              "INVALID_ARGS", "Bluetooth printer address or data is missing", nullptr));
+              address.empty() ? "DEVICE_UNAVAILABLE" : "BLUETOOTH_WRITE_FAILED",
+              address.empty() ? "Bluetooth printer address is missing"
+                              : "Bluetooth print payload is empty",
+              nullptr));
         } else {
           auto* operation = new BluetoothOperation{
               FL_METHOD_CALL(g_object_ref(method_call)),
               BluetoothOperationKind::print,
               address,
               data_bytes,
+              ++next_bluetooth_operation_id,
           };
           start_bluetooth_operation(operation);
           return;
@@ -797,13 +1091,19 @@ static void method_call_cb(FlMethodChannel* channel,
         const auto data_bytes = bytes_from_value(data_val);
         if (path.empty() || data_bytes.empty()) {
           response = FL_METHOD_RESPONSE(fl_method_error_response_new(
-              "INVALID_ARGS", "USB printer path or data is missing", nullptr));
-        } else if (print_usb_printer(path, data_bytes)) {
-          g_autoptr(FlValue) result = fl_value_new_bool(TRUE);
-          response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
+              path.empty() ? "DEVICE_UNAVAILABLE" : "USB_WRITE_FAILED",
+              path.empty() ? "USB printer path is missing" : "USB print payload is empty",
+              nullptr));
         } else {
-          response = FL_METHOD_RESPONSE(fl_method_error_response_new(
-              "PRINT_ERROR", "Unable to write data to the USB printer", nullptr));
+          auto* operation = new UsbOperation{
+              FL_METHOD_CALL(g_object_ref(method_call)),
+              UsbOperationKind::print,
+              path,
+              data_bytes,
+              ++next_usb_operation_id,
+          };
+          start_usb_operation(operation);
+          return;
         }
         fl_method_call_respond(method_call, response, nullptr);
         return;
@@ -855,26 +1155,14 @@ static void method_call_cb(FlMethodChannel* channel,
                 "INVALID_ARGS", "Data is empty or unsupported type",
                 nullptr));
           } else {
-            // Primary: lp -o raw (bypasses all CUPS driver filters).
-            // Fallback: CUPS C API (may be filtered by printer driver).
-            bool ok = lp_print_raw(printer_name.c_str(),
-                                   data_bytes.data(),
-                                   data_bytes.size());
-            if (!ok) {
-              ok = cups_print_raw(printer_name.c_str(),
-                                  data_bytes.data(),
-                                  data_bytes.size());
-            }
-            if (ok) {
-              g_autoptr(FlValue) result = fl_value_new_bool(TRUE);
-              response =
-                  FL_METHOD_RESPONSE(fl_method_success_response_new(result));
-            } else {
-              const char* err = cupsLastErrorString();
-              response = FL_METHOD_RESPONSE(fl_method_error_response_new(
-                  "PRINT_ERROR",
-                  err ? err : "Failed to submit CUPS print job", nullptr));
-            }
+            auto* operation = new CupsPrintOperation{
+                FL_METHOD_CALL(g_object_ref(method_call)),
+                printer_name,
+                data_bytes,
+                ++next_cups_operation_id,
+            };
+            start_cups_print_operation(operation);
+            return;
           }
         }
       }

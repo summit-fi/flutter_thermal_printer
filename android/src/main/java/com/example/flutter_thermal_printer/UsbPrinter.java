@@ -34,6 +34,7 @@ public class UsbPrinter implements EventChannel.StreamHandler {
     private static final String ACTION_USB_DETACHED = "android.hardware.usb.action.USB_DEVICE_DETACHED";
     private static final String TAG = "FPP";
     private EventChannel.EventSink events;
+    private volatile UsbDeviceConnection activeConnection;
 
     private BroadcastReceiver usbStateChangeReceiver;
 
@@ -53,7 +54,7 @@ public class UsbPrinter implements EventChannel.StreamHandler {
                 }
                 Log.d(TAG, "ACTION_USB_PERMISSION " + (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)));
                 if (Objects.equals(intent.getAction(), ACTION_USB_PERMISSION)) {
-                    synchronized (this) {
+                    synchronized (UsbPrinter.this) {
                         UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
                         boolean permissionGranted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false);
                         if(permissionGranted) {
@@ -61,7 +62,6 @@ public class UsbPrinter implements EventChannel.StreamHandler {
                             sendDevice(device);
                         } else {
                             Log.d(TAG, "Permission denied for device " + device);
-                            connect(connectionVendorId, connectionProductId);
                         }
                     }
                 }
@@ -139,10 +139,6 @@ public class UsbPrinter implements EventChannel.StreamHandler {
         return data;
     }
 
-    private String connectionVendorId;
-    private String connectionProductId;
-
-    private Integer requestingPermission = 0;
 
     private UsbDevice findDevice(String vendorId, String productId) {
         UsbManager m = (UsbManager) context.getSystemService(USB_SERVICE);
@@ -178,8 +174,6 @@ public class UsbPrinter implements EventChannel.StreamHandler {
 
     //    Connect using VendorId and ProductId
     public boolean connect(String vendorId, String productId) {
-        connectionVendorId = vendorId;
-        connectionProductId = productId;
         UsbManager m = (UsbManager) context.getSystemService(Context.USB_SERVICE);
         UsbDevice device = findDevice(vendorId, productId);
 
@@ -188,13 +182,11 @@ public class UsbPrinter implements EventChannel.StreamHandler {
             return false;
         }
 
-        if (!m.hasPermission(device) && requestingPermission <2) {
-            requestingPermission++;
+        if (!m.hasPermission(device)) {
             PendingIntent permissionIntent = PendingIntent.getBroadcast(context, 0, new Intent(ACTION_USB_PERMISSION), PendingIntent.FLAG_IMMUTABLE);
             m.requestPermission(device, permissionIntent);
             return false;
         } else {
-            requestingPermission = 0;
             sendDevice(device); // Proceed directly if permission exists
             return m.hasPermission(device);
         }
@@ -202,6 +194,7 @@ public class UsbPrinter implements EventChannel.StreamHandler {
 
     //    Print text on the printer
     public boolean printText(String vendorId, String productId, List<Integer> bytes) {
+        final long deadlineNanos = System.nanoTime() + 30_000_000_000L;
         UsbManager m = (UsbManager) context.getSystemService(USB_SERVICE);
         UsbDevice device = findDevice(vendorId, productId);
         if (device == null) {
@@ -220,43 +213,58 @@ public class UsbPrinter implements EventChannel.StreamHandler {
             return false;
         }
         UsbDeviceConnection connection = m.openDevice(device);
-
         if (connection == null) {
             Log.d(TAG, "Cannot print. Failed to open USB device.");
             return false;
         }
-        if (device.getInterfaceCount() == 0) {
-            Log.d(TAG, "Cannot print. USB device has no interfaces.");
-            connection.close();
-            return false;
-        }
-        boolean interfaceClaimed = connection.claimInterface(device.getInterface(0), true);
-        if (!interfaceClaimed) {
-            Log.d(TAG, "Cannot print. Failed to claim USB interface.");
-            connection.close();
-            return false;
-        }
-        UsbEndpoint mBulkEndOut = null;
-        for (int i = 0; i < device.getInterface(0).getEndpointCount(); i++) {
-            if (device.getInterface(0).getEndpoint(i).getType() == UsbConstants.USB_ENDPOINT_XFER_BULK && device.getInterface(0).getEndpoint(i).getDirection() == UsbConstants.USB_DIR_OUT) {
-                mBulkEndOut = device.getInterface(0).getEndpoint(i);
-                break;
+        activeConnection = connection;
+
+        UsbEndpoint bulkEndOut = null;
+        boolean interfaceClaimed = false;
+        try {
+            if (device.getInterfaceCount() == 0) {
+                Log.d(TAG, "Cannot print. USB device has no interfaces.");
+                return false;
             }
-        }
-        if (mBulkEndOut == null) {
-            Log.d(TAG, "Cannot print. Bulk OUT endpoint not found.");
-            connection.releaseInterface(device.getInterface(0));
+            android.hardware.usb.UsbInterface printerInterface = device.getInterface(0);
+            interfaceClaimed = connection.claimInterface(printerInterface, true);
+            if (!interfaceClaimed) {
+                Log.d(TAG, "Cannot print. Failed to claim USB interface.");
+                return false;
+            }
+            for (int i = 0; i < printerInterface.getEndpointCount(); i++) {
+                UsbEndpoint endpoint = printerInterface.getEndpoint(i);
+                if (endpoint.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK
+                        && endpoint.getDirection() == UsbConstants.USB_DIR_OUT) {
+                    bulkEndOut = endpoint;
+                    break;
+                }
+            }
+            if (bulkEndOut == null) {
+                Log.d(TAG, "Cannot print. Bulk OUT endpoint not found.");
+                return false;
+            }
+            byte[] data = new byte[bytes.size()];
+            for (int i = 0; i < bytes.size(); i++) {
+                data[i] = bytes.get(i).byteValue();
+            }
+            long remainingMillis = (deadlineNanos - System.nanoTime()) / 1_000_000L;
+            if (remainingMillis <= 0) {
+                Log.d(TAG, "Cannot print. USB operation deadline expired.");
+                return false;
+            }
+            int transferTimeout = (int) Math.min(5000L, remainingMillis);
+            int transferred = connection.bulkTransfer(bulkEndOut, data, data.length, transferTimeout);
+            return transferred >= 0;
+        } finally {
+            if (activeConnection == connection) {
+                activeConnection = null;
+            }
+            if (interfaceClaimed && device.getInterfaceCount() > 0) {
+                connection.releaseInterface(device.getInterface(0));
+            }
             connection.close();
-            return false;
         }
-        byte[] data = new byte[bytes.size()];
-        for (int i = 0; i < bytes.size(); i++) {
-            data[i] = bytes.get(i).byteValue();
-        }
-        int transferred = connection.bulkTransfer(mBulkEndOut, data, data.length, 5000);
-        connection.releaseInterface(device.getInterface(0));
-        connection.close();
-        return transferred >= 0;
     }
 
     public boolean isConnected(String vendorId, String productId) {
@@ -268,6 +276,13 @@ public class UsbPrinter implements EventChannel.StreamHandler {
         return m.hasPermission(device);
     }
 
+    public void cancelActiveOperation() {
+        UsbDeviceConnection connection = activeConnection;
+        if (connection != null) {
+            Log.d(TAG, "Cancelling active USB operation by closing connection.");
+            connection.close();
+        }
+    }
 
     public boolean disconnect(String vendorId, String productId) {
         UsbManager m = (UsbManager) context.getSystemService(USB_SERVICE);

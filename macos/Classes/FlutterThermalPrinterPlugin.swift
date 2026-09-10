@@ -84,7 +84,16 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
         case "disconnect":
             let args = call.arguments as? [String: Any]
             if isBluetoothClassic(args) {
-                result(disconnectBluetoothClassic(args: args))
+                guard let address = args?["address"] as? String, !address.isEmpty else {
+                    result(FlutterError(code: "DEVICE_UNAVAILABLE", message: "The Bluetooth printer address is missing.", details: nil))
+                    return
+                }
+                result(disconnectBluetoothClassic(address: address))
+                return
+            }
+            if isDirectUsb(args) {
+                // Direct USB handles are opened and closed per operation.
+                result(true)
                 return
             }
             let printerName = args?["vendorId"] as? String ?? ""
@@ -112,25 +121,37 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
 
     private func connectDirectUsb(args: [String: Any]?, result: @escaping FlutterResult) {
         guard let address = args?["address"] as? String else {
-            result(false)
+            result(FlutterError(code: "DEVICE_UNAVAILABLE", message: "The USB printer address is missing.", details: nil))
             return
         }
         DispatchQueue.global(qos: .userInitiated).async { [usbTransport] in
             let connected = usbTransport.canOpen(address: address)
-            DispatchQueue.main.async { result(connected) }
+            DispatchQueue.main.async {
+                if connected {
+                    result(true)
+                } else {
+                    result(FlutterError(code: "USB_OPEN_FAILED", message: "Unable to open the USB printer.", details: nil))
+                }
+            }
         }
     }
 
     private func printDirectUsb(args: [String: Any]?, result: @escaping FlutterResult) {
         guard let address = args?["address"] as? String else {
-            result(false)
+            result(FlutterError(code: "DEVICE_UNAVAILABLE", message: "The USB printer address is missing.", details: nil))
             return
         }
         let bytes = args?["data"] as? [Int] ?? []
         let data = Data(bytes.map { UInt8(truncatingIfNeeded: $0) })
         DispatchQueue.global(qos: .userInitiated).async { [usbTransport] in
             let printed = usbTransport.write(data: data, address: address)
-            DispatchQueue.main.async { result(printed) }
+            DispatchQueue.main.async {
+                if printed {
+                    result(true)
+                } else {
+                    result(FlutterError(code: "USB_WRITE_FAILED", message: "Unable to write to the USB printer.", details: nil))
+                }
+            }
         }
     }
 
@@ -148,7 +169,7 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
     private func connectBluetoothClassic(args: [String: Any]?, result: @escaping FlutterResult) {
         guard let address = args?["address"] as? String, !address.isEmpty else {
             bluetoothLog("connect.failed reason=missing_address")
-            result(false)
+            result(FlutterError(code: "DEVICE_UNAVAILABLE", message: "The Bluetooth printer address is missing.", details: nil))
             return
         }
         bluetoothLog("connect.started address=\(address)")
@@ -159,7 +180,7 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
                 result(true)
             case .failure(let error):
                 self?.bluetoothLog("connect.failed address=\(address) error=\(error.localizedDescription)")
-                result(false)
+                result(FlutterError(code: "BLUETOOTH_CONNECT_FAILED", message: error.localizedDescription, details: nil))
             }
         }
     }
@@ -167,7 +188,7 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
     private func printBluetoothClassic(args: [String: Any]?, result: @escaping FlutterResult) {
         guard let address = args?["address"] as? String, !address.isEmpty else {
             bluetoothLog("print.failed reason=missing_address")
-            result(false)
+            result(FlutterError(code: "DEVICE_UNAVAILABLE", message: "The Bluetooth printer address is missing.", details: nil))
             return
         }
         let bytes = args?["data"] as? [Int] ?? []
@@ -184,7 +205,7 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
                 result(true)
             case .failure(let error):
                 self?.bluetoothLog("print.failed address=\(address) bytes=\(data.count) error=\(error.localizedDescription)")
-                result(false)
+                result(FlutterError(code: "BLUETOOTH_WRITE_FAILED", message: error.localizedDescription, details: nil))
             }
         }
     }
@@ -196,15 +217,14 @@ public class FlutterThermalPrinterPlugin: NSObject, FlutterPlugin  , FlutterStre
         return isConnected
     }
 
-    private func disconnectBluetoothClassic(args: [String: Any]?) -> Bool {
-        guard let address = args?["address"] as? String, !address.isEmpty else { return false }
+    private func disconnectBluetoothClassic(address: String) -> Bool {
         bluetoothTransport.disconnect(address: address)
         bluetoothLog("disconnect.requested address=\(address)")
         return true
     }
 
     private func bluetoothLog(_ message: String) {
-        NSLog("[FlutterThermalPrinterNative] macos.bluetooth \(message)")
+        NSLog("[FlutterThermalPrinterNative] platform=macos transport=bluetoothClassic \(message)")
     }
     
     // MARK: - New Printer-based Implementation
