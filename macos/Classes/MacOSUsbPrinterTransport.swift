@@ -3,10 +3,12 @@ import IOKit
 import IOKit.usb
 import IOKit.usb.IOUSBLib
 
-final class MacOSUsbPrinterTransport {
-  private static let operationTimeoutNanoseconds: UInt64 = 30 * 1_000_000_000
-  private static let pipeTimeoutMilliseconds: UInt32 = 10_000
+private enum MacOSUsbTransportTimeouts {
+  static let operationTimeoutNanoseconds: UInt64 = 30 * 1_000_000_000
+  static let pipeTimeoutMilliseconds: UInt32 = 10_000
+}
 
+final class MacOSUsbPrinterTransport {
   func canOpen(address: String) -> Bool {
     perform(address: address, data: nil)
   }
@@ -244,7 +246,7 @@ private final class OpenUsbPrinterInterface {
     let startedAt = DispatchTime.now().uptimeNanoseconds
     while offset < data.count {
       let elapsed = DispatchTime.now().uptimeNanoseconds - startedAt
-      guard elapsed < Self.operationTimeoutNanoseconds else {
+      guard elapsed < MacOSUsbTransportTimeouts.operationTimeoutNanoseconds else {
         NSLog("[FlutterThermalPrinterNative] macos.usb write.timeout bytes=\(data.count) offset=\(offset)")
         return false
       }
@@ -252,8 +254,8 @@ private final class OpenUsbPrinterInterface {
       let length = min(chunkSize, data.count - offset)
       let remainingMilliseconds = UInt32(
         min(
-          UInt64(Self.pipeTimeoutMilliseconds),
-          (Self.operationTimeoutNanoseconds - elapsed) / 1_000_000
+          UInt64(MacOSUsbTransportTimeouts.pipeTimeoutMilliseconds),
+          (MacOSUsbTransportTimeouts.operationTimeoutNanoseconds - elapsed) / 1_000_000
         )
       )
       guard remainingMilliseconds > 0 else {
