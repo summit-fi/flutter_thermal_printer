@@ -169,11 +169,11 @@ void main() {
     });
 
     group('bleConfig', () {
-      test('has default config with 10 second delay', () {
+      test('has default config with zero stabilization delay', () {
         final config = PrinterManager.instance.bleConfig;
         expect(
           config.connectionStabilizationDelay,
-          const Duration(seconds: 10),
+          Duration.zero,
         );
       });
 

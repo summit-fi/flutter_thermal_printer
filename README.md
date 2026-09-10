@@ -135,7 +135,7 @@ await FlutterThermalPrinter.instance.connect(
   connectionStabilizationDelay: Duration(seconds: 2),
 );
 
-// Default behavior (10 seconds) - no configuration needed
+// Default behavior (no artificial delay) - no configuration needed
 await FlutterThermalPrinter.instance.connect(printer);
 ```
 
@@ -143,7 +143,7 @@ await FlutterThermalPrinter.instance.connect(printer);
 |---------------|----------|
 | Global config | Set once for consistent behavior across all connections |
 | Per-call override | Fine-tune for specific printer models that connect faster/slower |
-| Default (10s) | Backwards compatible, works with most printers |
+| Default (0s) | Uses the native connection and GATT readiness lifecycle |
 
 ---
 

@@ -4,11 +4,11 @@ import 'package:flutter_thermal_printer/utils/ble_config.dart';
 void main() {
   group('BleConfig', () {
     group('constructor', () {
-      test('uses default connectionStabilizationDelay of 10 seconds', () {
+      test('uses zero connectionStabilizationDelay by default', () {
         const config = BleConfig();
         expect(
           config.connectionStabilizationDelay,
-          const Duration(seconds: 10),
+          Duration.zero,
         );
       });
 
@@ -100,7 +100,7 @@ void main() {
         const config = BleConfig();
         final result = config.toString();
 
-        expect(result, contains('0:00:10'));
+        expect(result, contains('0:00:00'));
       });
     });
 

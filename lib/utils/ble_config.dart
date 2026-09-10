@@ -1,6 +1,6 @@
 class BleConfig {
   const BleConfig({
-    this.connectionStabilizationDelay = const Duration(seconds: 10),
+    this.connectionStabilizationDelay = Duration.zero,
     this.connectionTimeout = const Duration(seconds: 30),
     this.printTimeout = const Duration(seconds: 30),
   });

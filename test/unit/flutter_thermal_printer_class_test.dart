@@ -105,11 +105,11 @@ void main() {
     });
 
     group('bleConfig', () {
-      test('has default config with 10 second delay', () {
+      test('has default config with zero stabilization delay', () {
         final config = FlutterThermalPrinter.instance.bleConfig;
         expect(
           config.connectionStabilizationDelay,
-          const Duration(seconds: 10),
+          Duration.zero,
         );
       });
 
@@ -183,7 +183,7 @@ void main() {
     test('BleConfig is exported', () {
       const config = BleConfig();
       expect(config, isNotNull);
-      expect(config.connectionStabilizationDelay, const Duration(seconds: 10));
+      expect(config.connectionStabilizationDelay, Duration.zero);
     });
   });
 }
