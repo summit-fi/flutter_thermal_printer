@@ -970,6 +970,7 @@ static void method_call_cb(FlMethodChannel* channel,
           FL_METHOD_CALL(g_object_ref(method_call)),
           BluetoothOperationKind::connect,
           address,
+          {},
           ++next_bluetooth_operation_id,
       };
       start_bluetooth_operation(operation);
@@ -1020,6 +1021,7 @@ static void method_call_cb(FlMethodChannel* channel,
           FL_METHOD_CALL(g_object_ref(method_call)),
           BluetoothOperationKind::connect,
           address,
+          {},
           ++next_bluetooth_operation_id,
       };
       operation->return_false_as_value = true;
