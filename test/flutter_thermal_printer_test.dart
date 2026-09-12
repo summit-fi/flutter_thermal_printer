@@ -20,7 +20,15 @@ class MockFlutterThermalPrinterPlatform
   Future<bool> connect(Printer device) async => true;
 
   @override
-  Future<bool> printText(Printer device, Uint8List data, {String? path}) async => true;
+  Future<void> cancelConnect() async {}
+
+  @override
+  Future<bool> printText(Printer device, Uint8List data,
+          {String? path}) async =>
+      true;
+
+  @override
+  Future<void> cancelPrint() async {}
 
   @override
   Future<bool> isConnected(Printer device) async => false;
@@ -43,7 +51,8 @@ void main() {
 
   group('FlutterThermalPrinterPlatform', () {
     test('MethodChannelFlutterThermalPrinter is the default instance', () {
-      expect(initialPlatform, isInstanceOf<MethodChannelFlutterThermalPrinter>());
+      expect(
+          initialPlatform, isInstanceOf<MethodChannelFlutterThermalPrinter>());
     });
   });
 
@@ -60,11 +69,13 @@ void main() {
     });
 
     test('devicesStream is available', () {
-      expect(FlutterThermalPrinter.instance.devicesStream, isA<Stream<List<Printer>>>());
+      expect(FlutterThermalPrinter.instance.devicesStream,
+          isA<Stream<List<Printer>>>());
     });
 
     test('isBleTurnedOnStream is available', () {
-      expect(FlutterThermalPrinter.instance.isBleTurnedOnStream, isA<Stream<bool>>());
+      expect(FlutterThermalPrinter.instance.isBleTurnedOnStream,
+          isA<Stream<bool>>());
     });
   });
 

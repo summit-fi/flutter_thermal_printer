@@ -10,6 +10,12 @@ class MockFlutterThermalPrinterPlatform extends FlutterThermalPrinterPlatform
     with MockPlatformInterfaceMixin {
   @override
   Future<String?> getPlatformVersion() async => 'Mock Platform';
+
+  @override
+  Future<void> cancelConnect() async {}
+
+  @override
+  Future<void> cancelPrint() async {}
 }
 
 class InvalidPlatform extends FlutterThermalPrinterPlatform {}

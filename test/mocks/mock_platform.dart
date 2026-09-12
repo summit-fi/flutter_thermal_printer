@@ -49,6 +49,11 @@ class MockFlutterThermalPrinterPlatform extends FlutterThermalPrinterPlatform
   }
 
   @override
+  Future<void> cancelConnect() async {
+    methodCalls.add('cancelConnect');
+  }
+
+  @override
   Future<bool> isConnected(Printer device) async {
     methodCalls.add('isConnected');
     methodArguments.add(device);
@@ -67,6 +72,11 @@ class MockFlutterThermalPrinterPlatform extends FlutterThermalPrinterPlatform
     methodCalls.add('printText');
     methodArguments.add({'device': device, 'data': data, 'path': path});
     return true;
+  }
+
+  @override
+  Future<void> cancelPrint() async {
+    methodCalls.add('cancelPrint');
   }
 
   @override
