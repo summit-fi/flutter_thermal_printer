@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_thermal_printer/flutter_thermal_printer_platform_interface.dart';
@@ -118,6 +119,38 @@ void main() {
         final printer = Printer();
 
         final result = await PrinterManager.instance.isConnected(printer);
+        expect(result, false);
+      });
+
+      test('checks network printer reachability with a bounded TCP probe',
+          () async {
+        final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+        final connectionSubscription = server.listen((socket) {
+          unawaited(socket.close());
+        });
+        addTearDown(() async {
+          await connectionSubscription.cancel();
+          await server.close();
+        });
+
+        final printer = Printer(
+          address: '127.0.0.1:${server.port}',
+          connectionType: ConnectionType.NETWORK,
+        );
+
+        final result = await PrinterManager.instance.isConnected(printer);
+
+        expect(result, true);
+      });
+
+      test('returns false for an invalid network endpoint', () async {
+        final printer = Printer(
+          address: 'not-a-valid-endpoint:invalid',
+          connectionType: ConnectionType.NETWORK,
+        );
+
+        final result = await PrinterManager.instance.isConnected(printer);
+
         expect(result, false);
       });
     });

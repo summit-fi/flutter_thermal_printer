@@ -46,6 +46,7 @@ class PrinterManager {
   int? _activeBleConnectionOperationId;
   Printer? _activeBleConnectionDevice;
   static const Duration _bleStateSyncInterval = Duration(seconds: 3);
+  static const Duration _networkConnectionCheckTimeout = Duration(seconds: 3);
 
   static const String _channelName = 'flutter_thermal_printer/events';
   final EventChannel _eventChannel = const EventChannel(_channelName);
@@ -203,7 +204,7 @@ class PrinterManager {
         return false;
       }
     } else if (device.connectionType == ConnectionType.NETWORK) {
-      return true;
+      return _isNetworkPrinterReachable(device);
     }
     return false;
   }
@@ -644,6 +645,66 @@ class PrinterManager {
       log('Failed to fetch BLE state for $deviceId: $e');
       return false;
     }
+  }
+
+  /// Checks whether a network printer accepts a TCP connection on its raw
+  /// printing endpoint. The socket is intentionally short-lived: network
+  /// printers are connected on demand when a print job is sent.
+  Future<bool> _isNetworkPrinterReachable(Printer device) async {
+    final endpoint = _parseNetworkEndpoint(device.address);
+    if (endpoint == null) {
+      log('Cannot check network printer: invalid endpoint ${device.address}');
+      return false;
+    }
+
+    Socket? socket;
+    try {
+      socket = await Socket.connect(
+        endpoint.host,
+        endpoint.port,
+        timeout: _networkConnectionCheckTimeout,
+      );
+      return true;
+    } on Object catch (error) {
+      log(
+        'Network printer connection check failed for ${device.address}: $error',
+      );
+      return false;
+    } finally {
+      socket?.destroy();
+    }
+  }
+
+  ({String host, int port})? _parseNetworkEndpoint(String? address) {
+    final value = address?.trim() ?? '';
+    if (value.isEmpty) return null;
+
+    if (value.startsWith('[')) {
+      final closingBracket = value.indexOf(']');
+      if (closingBracket <= 1 || closingBracket + 1 >= value.length) {
+        return null;
+      }
+      final portText = value.split(']').last;
+      if (!portText.startsWith(':')) return null;
+      final port = int.tryParse(portText.replaceFirst(':', ''));
+      if (port == null || port < 1 || port > 65535) return null;
+
+      final host = value.split(']').first.replaceFirst('[', '');
+
+      return (host: host, port: port);
+    }
+
+    final separator = value.lastIndexOf(':');
+    if (value.indexOf(':') != separator) {
+      return null;
+    }
+    if (separator <= 0 || separator == value.length - 1) {
+      return (host: value, port: 9100);
+    }
+    final port = int.tryParse(value.split(':').last);
+    if (port == null || port < 1 || port > 65535) return null;
+
+    return (host: value.split(':').first, port: port);
   }
 
   Future<void> _syncBleDevicesAndConnectionState() async {

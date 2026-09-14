@@ -273,7 +273,19 @@ public class UsbPrinter implements EventChannel.StreamHandler {
         if (device == null) {
             return false;
         }
-        return m.hasPermission(device);
+        if (!m.hasPermission(device)) {
+            return false;
+        }
+
+        UsbDeviceConnection connection = m.openDevice(device);
+        if (connection == null) {
+            Log.d(TAG, "USB status probe failed to open device " + device);
+
+            return false;
+        }
+        connection.close();
+
+        return true;
     }
 
     public void cancelActiveOperation() {
