@@ -797,9 +797,11 @@ static gpointer run_bluetooth_operation(gpointer user_data) {
                     : "BLUETOOTH_CONNECT_FAILED"));
   const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - started_at).count();
+  const bool operation_succeeded = operation->success || operation->return_false_as_value;
   bluetooth_log(
       "operation.completed id=" + std::to_string(operation->operation_id) +
-      " success=" + std::to_string(operation->success) +
+      " success=" + std::to_string(operation_succeeded) +
+      " result=" + std::to_string(operation->success) +
       " errorCode=" + error_code +
       " durationMs=" + std::to_string(duration));
   g_main_context_invoke(nullptr, complete_bluetooth_operation, operation);
@@ -864,8 +866,10 @@ static gpointer run_usb_operation(gpointer user_data) {
                     : "USB_OPEN_FAILED"));
   const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - started_at).count();
+  const bool operation_succeeded = operation->success || operation->return_false_as_value;
   usb_log("operation.completed id=" + std::to_string(operation->operation_id) +
-          " success=" + std::to_string(operation->success) +
+          " success=" + std::to_string(operation_succeeded) +
+          " result=" + std::to_string(operation->success) +
           " errorCode=" + error_code +
           " durationMs=" + std::to_string(duration));
   g_main_context_invoke(nullptr, complete_usb_operation, operation);

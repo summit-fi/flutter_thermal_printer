@@ -167,10 +167,12 @@ public class FlutterThermalPrinterPlugin implements FlutterPlugin, MethodCallHan
               String completionCode = success
                       ? "SUCCESS"
                       : (errorOnFalse ? errorCode : "NONE");
+              boolean operationSucceeded = success || !errorOnFalse;
               android.util.Log.d("FPP", "operation.completed id=" + operationId
                       + " platform=android transport=" + transportFor(operation)
-                      + " operation=" + operation + " stage=" + (success ? "completed" : "failed")
-                      + " success=" + success
+                      + " operation=" + operation + " stage=" + (operationSucceeded ? "completed" : "failed")
+                      + " success=" + operationSucceeded
+                      + " result=" + success
                       + " errorCode=" + completionCode
                       + " durationMs=" + durationMs);
               if (!success && errorOnFalse) {
