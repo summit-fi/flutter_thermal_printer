@@ -5,7 +5,10 @@ import android.annotation.SuppressLint;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothSocket;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.util.Log;
@@ -21,7 +24,9 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
-public class BluetoothClassicPrinter {
+import io.flutter.plugin.common.EventChannel;
+
+public class BluetoothClassicPrinter implements EventChannel.StreamHandler {
     private static final String TAG = "FPP";
     private static final UUID SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
     private static final long OPERATION_TIMEOUT_MS = 30_000L;
@@ -30,9 +35,56 @@ public class BluetoothClassicPrinter {
     private final Map<String, BluetoothSocket> sockets = new HashMap<>();
     private final ScheduledExecutorService timeoutExecutor = Executors.newSingleThreadScheduledExecutor();
     private volatile BluetoothSocket activeSocket;
+    private volatile EventChannel.EventSink connectionEvents;
+    private BroadcastReceiver connectionReceiver;
 
     BluetoothClassicPrinter(Context context) {
         this.context = context.getApplicationContext();
+        registerConnectionReceiver();
+    }
+
+    @Override
+    public void onListen(Object arguments, EventChannel.EventSink events) {
+        connectionEvents = events;
+    }
+
+    @Override
+    public void onCancel(Object arguments) {
+        connectionEvents = null;
+    }
+
+    private void registerConnectionReceiver() {
+        connectionReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context receiverContext, Intent intent) {
+                String action = intent.getAction();
+                if (!BluetoothDevice.ACTION_ACL_CONNECTED.equals(action)
+                        && !BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(action)) {
+                    return;
+                }
+                BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                if (device == null) return;
+                boolean connected = BluetoothDevice.ACTION_ACL_CONNECTED.equals(action);
+                String address = device.getAddress();
+                Log.d(TAG, "bluetoothClassic.event state=" + (connected ? "connected" : "disconnected")
+                        + " address=" + address);
+                EventChannel.EventSink sink = connectionEvents;
+                if (sink == null) return;
+                Map<String, Object> event = new HashMap<>();
+                event.put("connectionType", "BLUETOOTH_CLASSIC");
+                event.put("address", address);
+                event.put("state", connected ? "connected" : "disconnected");
+                sink.success(event);
+            }
+        };
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
+        filter.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(connectionReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            context.registerReceiver(connectionReceiver, filter);
+        }
     }
 
     public synchronized boolean connect(String address) {
@@ -149,6 +201,13 @@ public class BluetoothClassicPrinter {
             sockets.clear();
         }
         timeoutExecutor.shutdownNow();
+        if (connectionReceiver != null) {
+            try {
+                context.unregisterReceiver(connectionReceiver);
+            } catch (IllegalArgumentException ignored) {
+            }
+            connectionReceiver = null;
+        }
     }
 
     @SuppressLint("MissingPermission")

@@ -33,6 +33,7 @@ public class FlutterThermalPrinterPlugin implements FlutterPlugin, MethodCallHan
   /// when the Flutter Engine is detached from the Activity
   private MethodChannel channel;
   private EventChannel eventChannel;
+  private EventChannel connectionEventChannel;
   private Context context;
   private UsbPrinter usbPrinter;
   private BluetoothClassicPrinter bluetoothClassicPrinter;
@@ -46,11 +47,13 @@ public class FlutterThermalPrinterPlugin implements FlutterPlugin, MethodCallHan
   public void onAttachedToEngine(@NonNull FlutterPluginBinding flutterPluginBinding) {
     channel = new MethodChannel(flutterPluginBinding.getBinaryMessenger(), "flutter_thermal_printer");
     eventChannel = new EventChannel(flutterPluginBinding.getBinaryMessenger(), "flutter_thermal_printer/events");
+    connectionEventChannel = new EventChannel(flutterPluginBinding.getBinaryMessenger(), "flutter_thermal_printer/connection_events");
     channel.setMethodCallHandler(this);
     context = flutterPluginBinding.getApplicationContext();
     usbPrinter = new UsbPrinter(context); 
     bluetoothClassicPrinter = new BluetoothClassicPrinter(context);
     eventChannel.setStreamHandler(usbPrinter);
+    connectionEventChannel.setStreamHandler(bluetoothClassicPrinter);
   }
 
   @Override
@@ -118,6 +121,7 @@ public class FlutterThermalPrinterPlugin implements FlutterPlugin, MethodCallHan
   public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
     channel.setMethodCallHandler(null);
     eventChannel.setStreamHandler(null);
+    connectionEventChannel.setStreamHandler(null);
     bluetoothClassicPrinter.closeAll();
     usbPrinter.cancelActiveOperation();
     executor.shutdownNow();

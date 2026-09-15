@@ -10,10 +10,12 @@ import 'package:screenshot/screenshot.dart';
 import 'printer_manager.dart';
 import 'utils/ble_config.dart';
 import 'utils/printer.dart';
+import 'utils/printer_connection_event.dart';
 
 export 'package:esc_pos_utils_plus/esc_pos_utils_plus.dart';
 export 'package:flutter_thermal_printer/network/network_printer.dart';
 export 'package:flutter_thermal_printer/utils/ble_config.dart';
+export 'package:flutter_thermal_printer/utils/printer_connection_event.dart';
 export 'package:universal_ble/universal_ble.dart';
 
 /// Main class for thermal printer operations across all platforms
@@ -60,6 +62,10 @@ class FlutterThermalPrinter {
   /// Stream to monitor Bluetooth state
   Stream<bool> get isBleTurnedOnStream =>
       PrinterManager.instance.isBleTurnedOnStream;
+
+  /// Native Classic Bluetooth connection-state events.
+  Stream<PrinterConnectionEvent> get connectionEvents =>
+      PrinterManager.instance.connectionEvents;
 
   // ==========================================================================
   // PUBLIC METHODS - CORE PRINTER OPERATIONS

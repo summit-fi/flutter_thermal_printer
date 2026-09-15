@@ -13,6 +13,7 @@ import 'flutter_thermal_printer_platform_interface.dart';
 import 'network/network_printer.dart';
 import 'utils/ble_config.dart';
 import 'utils/printer.dart';
+import 'utils/printer_connection_event.dart';
 
 /// Universal printer manager for all platforms
 /// Handles BLE and USB printer discovery and operations using universal_ble for all platforms
@@ -50,8 +51,17 @@ class PrinterManager {
 
   static const String _channelName = 'flutter_thermal_printer/events';
   final EventChannel _eventChannel = const EventChannel(_channelName);
+  final EventChannel _connectionEventChannel =
+      const EventChannel('flutter_thermal_printer/connection_events');
 
   final List<Printer> _devices = [];
+
+  Stream<PrinterConnectionEvent> get connectionEvents =>
+      _connectionEventChannel.receiveBroadcastStream().map(
+            (event) => PrinterConnectionEvent.fromJson(
+              Map<String, dynamic>.from(event as Map),
+            ),
+          );
 
   /// Initialize the manager and check BLE availability
   Future<void> initialize() async {
