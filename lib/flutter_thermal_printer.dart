@@ -11,11 +11,13 @@ import 'printer_manager.dart';
 import 'utils/ble_config.dart';
 import 'utils/printer.dart';
 import 'utils/printer_connection_event.dart';
+import 'utils/printer_operation_result.dart';
 
 export 'package:esc_pos_utils_plus/esc_pos_utils_plus.dart';
 export 'package:flutter_thermal_printer/network/network_printer.dart';
 export 'package:flutter_thermal_printer/utils/ble_config.dart';
 export 'package:flutter_thermal_printer/utils/printer_connection_event.dart';
+export 'package:flutter_thermal_printer/utils/printer_operation_result.dart';
 export 'package:universal_ble/universal_ble.dart';
 
 /// Main class for thermal printer operations across all platforms
@@ -112,6 +114,20 @@ class FlutterThermalPrinter {
         /// [refreshDuration] The duration between each scan refresh.
         /// [connectionTypes] List of connection types to scan for (BLE, USB).
         /// [androidUsesFineLocation] Whether to use fine location on Android for BLE scanning.
+        longData: longData,
+        chunkSize: chunkSize,
+      );
+
+  /// Prints raw data and preserves the native error code when available.
+  Future<PrinterOperationResult> printDataResult(
+    Printer device,
+    List<int> bytes, {
+    bool longData = false,
+    int? chunkSize,
+  }) =>
+      PrinterManager.instance.printDataResult(
+        device,
+        bytes,
         longData: longData,
         chunkSize: chunkSize,
       );

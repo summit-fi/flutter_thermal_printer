@@ -14,6 +14,7 @@ import 'network/network_printer.dart';
 import 'utils/ble_config.dart';
 import 'utils/printer.dart';
 import 'utils/printer_connection_event.dart';
+import 'utils/printer_operation_result.dart';
 
 /// Universal printer manager for all platforms
 /// Handles BLE and USB printer discovery and operations using universal_ble for all platforms
@@ -400,6 +401,53 @@ class PrinterManager {
     }
     return false;
   }
+
+  /// Prints data and preserves the native error code for the caller.
+  ///
+  /// [printData] remains the compatibility API for existing consumers. New
+  /// callers should use this method when they need to decide whether a retry
+  /// is safe.
+  Future<PrinterOperationResult> printDataResult(
+    Printer printer,
+    List<int> bytes, {
+    bool longData = false,
+    int? chunkSize,
+  }) async {
+    try {
+      final success = await printData(
+        printer,
+        bytes,
+        longData: longData,
+        chunkSize: chunkSize,
+      );
+      if (success) {
+        return const PrinterOperationResult.success();
+      }
+
+      return PrinterOperationResult.failure(
+        errorCode: _printFailureCode(printer),
+      );
+    } on PlatformException catch (error) {
+      return PrinterOperationResult.failure(
+        errorCode: error.code,
+        message: error.message,
+      );
+    } catch (error) {
+      return PrinterOperationResult.failure(
+        errorCode: _printFailureCode(printer),
+        message: error.toString(),
+      );
+    }
+  }
+
+  String _printFailureCode(Printer printer) => switch (printer.connectionType) {
+        ConnectionType.BLE ||
+        ConnectionType.BLUETOOTH_CLASSIC =>
+          'BLUETOOTH_WRITE_FAILED',
+        ConnectionType.USB => 'USB_WRITE_FAILED',
+        ConnectionType.NETWORK => 'NETWORK_WRITE_FAILED',
+        _ => 'DEVICE_UNAVAILABLE',
+      };
 
   bool _usesWindowsUsbDevicePath(Printer printer) =>
       printer.address?.startsWith(r'\\?\') ?? false;
