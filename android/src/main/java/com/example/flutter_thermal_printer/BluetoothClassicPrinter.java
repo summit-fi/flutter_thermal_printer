@@ -41,16 +41,19 @@ public class BluetoothClassicPrinter implements EventChannel.StreamHandler {
     BluetoothClassicPrinter(Context context) {
         this.context = context.getApplicationContext();
         registerConnectionReceiver();
+        Log.d(TAG, "bluetoothClassic.connectionReceiver constructed");
     }
 
     @Override
     public void onListen(Object arguments, EventChannel.EventSink events) {
         connectionEvents = events;
+        Log.d(TAG, "bluetoothClassic.connectionEvents onListen");
     }
 
     @Override
     public void onCancel(Object arguments) {
         connectionEvents = null;
+        Log.d(TAG, "bluetoothClassic.connectionEvents onCancel");
     }
 
     private void registerConnectionReceiver() {
@@ -63,18 +66,27 @@ public class BluetoothClassicPrinter implements EventChannel.StreamHandler {
                     return;
                 }
                 BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-                if (device == null) return;
+                if (device == null) {
+                    Log.d(TAG, "bluetoothClassic.event missing device action=" + action);
+                    return;
+                }
                 boolean connected = BluetoothDevice.ACTION_ACL_CONNECTED.equals(action);
                 String address = device.getAddress();
-                Log.d(TAG, "bluetoothClassic.event state=" + (connected ? "connected" : "disconnected")
+                Log.d(TAG, "bluetoothClassic.event received action=" + action
+                        + " state=" + (connected ? "connected" : "disconnected")
                         + " address=" + address);
                 EventChannel.EventSink sink = connectionEvents;
-                if (sink == null) return;
+                if (sink == null) {
+                    Log.d(TAG, "bluetoothClassic.event dropped reason=no_event_sink address=" + address);
+                    return;
+                }
                 Map<String, Object> event = new HashMap<>();
                 event.put("connectionType", "BLUETOOTH_CLASSIC");
                 event.put("address", address);
                 event.put("state", connected ? "connected" : "disconnected");
                 sink.success(event);
+                Log.d(TAG, "bluetoothClassic.event emitted state="
+                        + (connected ? "connected" : "disconnected") + " address=" + address);
             }
         };
         IntentFilter filter = new IntentFilter();
@@ -85,6 +97,7 @@ public class BluetoothClassicPrinter implements EventChannel.StreamHandler {
         } else {
             context.registerReceiver(connectionReceiver, filter);
         }
+        Log.d(TAG, "bluetoothClassic.connectionReceiver registered");
     }
 
     public synchronized boolean connect(String address) {
@@ -176,7 +189,11 @@ public class BluetoothClassicPrinter implements EventChannel.StreamHandler {
 
     public synchronized boolean isConnected(String address) {
         BluetoothSocket socket = sockets.get(address);
-        return socket != null && socket.isConnected();
+        boolean connected = socket != null && socket.isConnected();
+        Log.d(TAG, "bluetoothClassic.status address=" + address
+                + " socketPresent=" + (socket != null)
+                + " socketConnected=" + connected);
+        return connected;
     }
 
     public synchronized boolean disconnect(String address) {
