@@ -539,7 +539,11 @@ static void free_service_records(sdp_list_t* records) {
   sdp_list_free(records, nullptr);
 }
 
-static int serial_port_channel(const bdaddr_t& target, TransportDeadline deadline) {
+static int serial_port_channel_once(
+    const bdaddr_t& target,
+    TransportDeadline deadline,
+    bool* retryable_failure) {
+  *retryable_failure = false;
   char target_address[18]{};
   ba2str(&target, target_address);
   bluetooth_log("sdp.started address=" + std::string(target_address));
@@ -555,6 +559,7 @@ static int serial_port_channel(const bdaddr_t& target, TransportDeadline deadlin
   sdp_session_t* session = sdp_connect(&any, &target, SDP_RETRY_IF_BUSY);
   if (session == nullptr) {
     bluetooth_log("sdp.failed stage=connect errno=" + std::to_string(errno));
+    *retryable_failure = true;
     sdp_list_free(search_list, nullptr);
     sdp_list_free(attribute_list, nullptr);
     return -1;
@@ -594,6 +599,7 @@ static int serial_port_channel(const bdaddr_t& target, TransportDeadline deadlin
         " channel=" + std::to_string(channel));
   } else {
     bluetooth_log("sdp.failed stage=search status=" + std::to_string(status));
+    *retryable_failure = true;
   }
 
   free_service_records(response_list);
@@ -601,6 +607,32 @@ static int serial_port_channel(const bdaddr_t& target, TransportDeadline deadlin
   sdp_list_free(attribute_list, nullptr);
   sdp_close(session);
   return channel;
+}
+
+static int serial_port_channel(const bdaddr_t& target, TransportDeadline deadline) {
+  constexpr int kMaxAttempts = 2;
+  constexpr auto kRetryBackoff = std::chrono::milliseconds(100);
+
+  for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+    bool retryable_failure = false;
+    const int channel = serial_port_channel_once(target, deadline, &retryable_failure);
+    if (channel > 0 || !retryable_failure || attempt == kMaxAttempts) {
+      return channel;
+    }
+
+    if (std::chrono::steady_clock::now() + kRetryBackoff >= deadline) {
+      return -1;
+    }
+
+    char target_address[18]{};
+    ba2str(&target, target_address);
+    bluetooth_log(
+        "sdp.retry address=" + std::string(target_address) +
+        " nextAttempt=" + std::to_string(attempt + 1));
+    std::this_thread::sleep_for(kRetryBackoff);
+  }
+
+  return -1;
 }
 
 static bool connect_rfcomm_socket(
