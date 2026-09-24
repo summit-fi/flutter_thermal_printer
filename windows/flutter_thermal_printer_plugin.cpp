@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <iostream>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -52,7 +53,9 @@ constexpr DWORD kUsbWriteTimeoutMs = 10'000;
 
 /// Writes diagnostic messages to the Windows debugger output.
 void BluetoothLog(const std::wstring& message) {
-  OutputDebugStringW((L"[FlutterThermalPrinterNative] platform=windows transport=bluetoothClassic " + message + L"\n").c_str());
+  const auto line = L"[FlutterThermalPrinterNative] platform=windows transport=bluetoothClassic " + message;
+  OutputDebugStringW((line + L"\n").c_str());
+  std::wcerr << line << std::endl;
 }
 
 /// Writes USB transport diagnostics to the Windows debugger output.
@@ -170,7 +173,8 @@ bool BluetoothAddressFromString(const std::string& address, BTH_ADDR* result) {
 /// Waits for a non-blocking RFCOMM connect without blocking the worker indefinitely.
 bool WaitForConnect(
     SOCKET socket_handle,
-    const std::shared_ptr<std::atomic_bool>& cancellation) {
+    const std::shared_ptr<std::atomic_bool>& cancellation,
+    int* socket_error) {
   const auto deadline = std::chrono::steady_clock::now() + kBluetoothConnectTimeout;
   while (std::chrono::steady_clock::now() < deadline) {
     if (cancellation != nullptr && cancellation->load()) return false;
@@ -182,16 +186,27 @@ bool WaitForConnect(
     timeval timeout{};
     timeout.tv_usec = 100'000;
     const auto select_result = select(0, nullptr, &write_set, nullptr, &timeout);
-    if (select_result == SOCKET_ERROR) return false;
+    if (select_result == SOCKET_ERROR) {
+      if (socket_error != nullptr) *socket_error = WSAGetLastError();
+      return false;
+    }
     if (select_result == 0) continue;
 
-    int socket_error = 0;
-    int socket_error_size = sizeof(socket_error);
-    return getsockopt(socket_handle, SOL_SOCKET, SO_ERROR,
-                      reinterpret_cast<char*>(&socket_error),
-                      &socket_error_size) == 0 &&
-        socket_error == 0;
+    int socket_error_size = sizeof(int);
+    int connection_error = 0;
+    if (getsockopt(socket_handle, SOL_SOCKET, SO_ERROR,
+                   reinterpret_cast<char*>(&connection_error),
+                   &socket_error_size) != 0) {
+      if (socket_error != nullptr) *socket_error = WSAGetLastError();
+      return false;
+    }
+    if (connection_error != 0) {
+      if (socket_error != nullptr) *socket_error = connection_error;
+      return false;
+    }
+    return true;
   }
+  if (socket_error != nullptr) *socket_error = WSAETIMEDOUT;
   return false;
 }
 
@@ -572,9 +587,10 @@ bool FlutterThermalPrinterPlugin::ConnectBluetoothClassic(
     closesocket(socket_handle);
     return false;
   }
-  if (connect_result == SOCKET_ERROR && !WaitForConnect(socket_handle, cancellation)) {
+  int wait_error = 0;
+  if (connect_result == SOCKET_ERROR && !WaitForConnect(socket_handle, cancellation, &wait_error)) {
     BluetoothLog(L"connect.failed reason=timeout_or_socket_error error=" +
-                 std::to_wstring(WSAGetLastError()));
+                 std::to_wstring(wait_error));
     closesocket(socket_handle);
     return false;
   }
